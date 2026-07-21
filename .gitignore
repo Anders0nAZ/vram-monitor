@@ -1,0 +1,7 @@
+# logs (runtime output, can contain local machine details)
+*.log
+
+# tooling / local state
+.claude/
+__pycache__/
+*.pyc
