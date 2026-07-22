@@ -10,6 +10,8 @@ can I get it back without restarting anything."
 
 Stdlib only. No pip install, no framework, no config file.
 
+![The dashboard: a VRAM usage bar, per-source split, resident models, and a live load/unload event log.](docs/dashboard.png)
+
 ## What it does
 
 - Polls Ollama's `/api/ps` for precise per-model VRAM usage and GPU/CPU split.
