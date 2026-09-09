@@ -14,6 +14,8 @@ so non-Ollama usage (e.g. ComfyUI) is inferred as (board_used - ollama_vram)
 and load/unload for it is detected from jumps in that "other" figure.
 """
 
+import http.client
+import itertools
 import json
 import os
 import socket
@@ -30,7 +32,9 @@ from urllib.error import URLError
 PORT          = 11435                       # dashboard at http://<host>:11435
 HOST          = "0.0.0.0"                   # 0.0.0.0 = reachable from phone (LAN/Tailscale)
 POLL_SECONDS  = 2
-OLLAMA_URL    = "http://localhost:11434/api/ps"
+OLLAMA_PORT   = 11436                       # real Ollama, moved off 11434
+OLLAMA_BASE   = f"http://127.0.0.1:{OLLAMA_PORT}"
+OLLAMA_URL    = OLLAMA_BASE + "/api/ps"     # poller talks direct, not via the gate
 COMFY_URL     = "http://localhost:8188"
 COMFY_HINT    = "comfyui"                    # substring (lowercase) marking ComfyUI's GPU process
 IDLE_MINUTES  = 5                            # auto-free ComfyUI after this long idle
@@ -41,6 +45,19 @@ LOG_MAX_BYTES = 2_000_000
 EVENTS_KEEP   = 250
 SETTLE_CYCLES = 4        # polls to suppress "other" attribution after an ollama load/unload
 COMFY_RECENT_CYCLES = 30 # a VRAM drop counts as ComfyUI only if it generated within this many polls
+
+# --- admission gate -------------------------------------------------------
+GATE_HOST     = "0.0.0.0"                    # clients keep talking to :11434
+GATE_PORT     = 11434
+RESERVE_MB    = 1024                         # headroom never handed out
+MAX_HOLD_SECONDS = 120                       # under the historian 240s timeout
+RESERVE_TTL   = 25                           # secs an admitted alloc stays reserved
+COST_FILE     = "model-costs.json"
+DEFAULT_COST_MB = 4096                       # unknown model
+COST_FALLBACK_FACTOR = 1.2                   # disk size -> vram estimate
+BIG_MODEL_MB  = 6000                         # banner threshold while ComfyUI runs
+GATE_CONNECT_TIMEOUT = 10
+GATE_STREAM_TIMEOUT  = 900                   # idle gap, not total duration
 
 MB = 1024 * 1024
 GB = 1024 * 1024 * 1024
@@ -222,6 +239,7 @@ def detect_events(models, used, total, comfy, comfy_busy):
     if models is not None:
         for name, m in cur.items():
             if name not in p.models:
+                record_cost(name, m["vram_mb"])
                 log_event("LOAD", name, f"{m['vram_mb']/1024:.1f}GB  {m['gpu_pct']}% GPU")
                 ollama_event = True
         for name in p.models:
@@ -288,6 +306,18 @@ def poll_loop():
         detect_events(models, used, total, comfy, comfy_busy)
         comfy_idle_tick(comfy_busy)
 
+        # republish board totals for the gate, then admit whatever now fits
+        _board["used_mb"], _board["total_mb"] = used, total
+        gate_tick()
+        gate = gate_snapshot()
+
+        # Auto-eviction is deliberately off; surface the case, do not act on it.
+        banner = None
+        big = [m for m in (models or []) if m["vram_mb"] >= BIG_MODEL_MB]
+        if comfy_busy and big:
+            banner = (f"ComfyUI is generating while {big[0]['name']} holds "
+                      f"{big[0]['vram_mb'] / 1024:.1f}GB of VRAM.")
+
         ollama_mb = sum(m["vram_mb"] for m in (models or []))
         other_mb  = max(0, used - ollama_mb) if used is not None else None
         idle_s = None
@@ -302,6 +332,8 @@ def poll_loop():
                 "used_mb": used, "total_mb": total, "util": util,
                 "ollama_mb": ollama_mb, "other_mb": other_mb,
                 "comfy": comfy,
+                "gate": gate,
+                "banner": banner,
                 "auto_unload": _ctl["auto_unload"],
                 "idle_minutes": _ctl["idle_minutes"],
                 "comfy_idle_s": idle_s,
@@ -337,6 +369,420 @@ def do_action(action):
     return {"ok": False, "error": "unknown action"}
 
 
+# ---------------------------------------------------------------- gate: cost model
+# What a request would newly allocate. Learned from what Ollama actually reported
+# on past loads (size_vram), which beats guessing from file size on disk.
+_costs       = {}                 # normalized model name -> observed VRAM MB
+_costs_dirty = False
+_tags_cache  = {"at": 0.0, "sizes": {}}
+
+# Board totals, republished by poll_loop. Plain dict so the gate can read them
+# without taking _lock (which would invert the _gate_lock -> _lock ordering).
+_board = {"used_mb": None, "total_mb": None}
+
+
+def _norm_model(name):
+    if not name:
+        return None
+    return name if ":" in name else name + ":latest"
+
+
+def _seed_costs_from_log():
+    """Bootstrap the cost table from LOAD lines already sitting in the log."""
+    out = {}
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "LOAD" not in line or "(inferred)" in line:
+                    continue
+                parts = line.split()
+                try:
+                    i = parts.index("LOAD")
+                except ValueError:
+                    continue
+                if len(parts) < i + 3 or not parts[i + 2].endswith("GB"):
+                    continue
+                try:
+                    mb = int(round(float(parts[i + 2][:-2]) * 1024))
+                except ValueError:
+                    continue
+                key = _norm_model(parts[i + 1])
+                if key and mb > 0:
+                    out[key] = max(out.get(key, 0), mb)
+    except OSError:
+        pass
+    return out
+
+
+def load_costs():
+    global _costs
+    try:
+        with open(COST_FILE, "r", encoding="utf-8") as f:
+            _costs = {k: int(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        _costs = {}
+    if not _costs:
+        _costs = _seed_costs_from_log()
+        if _costs:
+            save_costs()
+    return len(_costs)
+
+
+def save_costs():
+    try:
+        with open(COST_FILE, "w", encoding="utf-8") as f:
+            json.dump(_costs, f, indent=1, sort_keys=True)
+    except OSError:
+        pass
+
+
+def record_cost(name, vram_mb):
+    """Called on every observed Ollama load so estimates improve over time."""
+    global _costs_dirty
+    key = _norm_model(name)
+    if not key or not vram_mb:
+        return
+    # High-water mark, matching _seed_costs_from_log. Under-estimating is the
+    # harmful direction - it admits a request that then forces the very spill the
+    # gate exists to prevent, while over-estimating only costs a little waiting.
+    # A stale high mark self-corrects the moment the model is deleted from
+    # model-costs.json, which is also how you reset after shrinking num_ctx.
+    mb = int(vram_mb)
+    if mb > _costs.get(key, 0):
+        _costs[key] = mb
+        _costs_dirty = True
+
+
+def _tag_sizes():
+    """Disk sizes from /api/tags, cached 60s - fallback cost for unseen models."""
+    now = time.monotonic()
+    if _tags_cache["sizes"] and now - _tags_cache["at"] < 60:
+        return _tags_cache["sizes"]
+    data = _get_json(OLLAMA_BASE + "/api/tags", timeout=4)
+    sizes = {}
+    if data:
+        for m in data.get("models", []):
+            key = _norm_model(m.get("name"))
+            sz = m.get("size") or 0
+            if key and sz:
+                sizes[key] = round(sz / MB)
+    if sizes:
+        _tags_cache.update({"at": now, "sizes": sizes})
+    return sizes or _tags_cache["sizes"]
+
+
+def _resident():
+    with _lock:
+        return {_norm_model(m["name"]) for m in _state.get("models", [])}
+
+
+def estimate_cost_mb(model):
+    """MB this request would newly allocate. 0 when the model is already resident."""
+    key = _norm_model(model)
+    if key is None:
+        return DEFAULT_COST_MB
+    if key in _resident():
+        return 0                                  # no new allocation - let it through
+    if key in _costs:
+        return _costs[key]
+    sz = _tag_sizes().get(key)
+    if sz:
+        return int(sz * COST_FALLBACK_FACTOR)
+    return DEFAULT_COST_MB
+
+
+# ---------------------------------------------------------------- gate: queue
+_gate_lock = threading.Lock()
+_gate_q    = []                   # FIFO of _Waiter
+_gate_busy = {}                   # waiter id -> {"model","cost_mb","since"}
+_gate_seq  = itertools.count(1)
+_gate_stat = {"queued": 0, "admitted": 0, "forced": 0}
+
+
+class _Waiter:
+    __slots__ = ("id", "model", "cost_mb", "event", "since", "forced")
+
+    def __init__(self, wid, model, cost_mb):
+        self.id      = wid
+        self.model   = model or "?"
+        self.cost_mb = cost_mb
+        self.event   = threading.Event()
+        self.since   = time.monotonic()
+        self.forced  = False
+
+
+def _reserved_locked():
+    """Admitted-but-not-yet-visible allocations.
+
+    An admitted request has not shown up in nvidia-smi yet, so without this a
+    second request in the same poll window would be admitted against the same
+    free VRAM. The reservation expires once the load would be visible.
+    """
+    now = time.monotonic()
+    return sum(v["cost_mb"] for v in _gate_busy.values()
+               if now - v["since"] < RESERVE_TTL)
+
+
+def _fits_locked(cost_mb):
+    if cost_mb <= 0:
+        return True
+    used, total = _board["used_mb"], _board["total_mb"]
+    if used is None or not total:
+        return True                               # can't measure -> fail open
+    free = total - used - _reserved_locked()
+    return free - RESERVE_MB >= cost_mb
+
+
+def _admit_locked(w):
+    _gate_busy[w.id] = {"model": w.model, "cost_mb": w.cost_mb,
+                        "since": time.monotonic()}
+
+
+def gate_acquire(model, cost_mb):
+    """Block until there is room for cost_mb. Always returns - never fails closed."""
+    w = _Waiter(next(_gate_seq), model, cost_mb)
+    with _gate_lock:
+        if not _gate_q and _fits_locked(cost_mb):
+            _admit_locked(w)
+            return w
+        _gate_q.append(w)
+        pos = len(_gate_q)
+        _gate_stat["queued"] += 1
+    log_event("QUEUE", w.model, f"needs {cost_mb / 1024:.1f}GB - position {pos}")
+
+    got    = w.event.wait(MAX_HOLD_SECONDS)
+    waited = time.monotonic() - w.since
+    if got:
+        with _gate_lock:
+            _gate_stat["admitted"] += 1
+        log_event("ADMIT", w.model, f"waited {waited:.0f}s")
+    else:
+        # Fail open. A queue that outlives the callers' own timeouts causes the
+        # very failure it exists to prevent.
+        with _gate_lock:
+            if w in _gate_q:
+                _gate_q.remove(w)
+            _admit_locked(w)
+            w.forced = True
+            _gate_stat["forced"] += 1
+        log_event("WARN", f"gate forced {w.model}",
+                  f"no room after {waited:.0f}s - forwarding anyway")
+    return w
+
+
+def gate_release(w):
+    if w is None:
+        return
+    with _gate_lock:
+        _gate_busy.pop(w.id, None)
+
+
+def gate_tick():
+    """Admit whatever now fits. Called from poll_loop; no extra thread."""
+    global _costs_dirty
+    admitted = []
+    with _gate_lock:
+        while _gate_q:
+            w = _gate_q[0]
+            if not _fits_locked(w.cost_mb):
+                break        # head-of-line blocking is deliberate: a small request
+                             # must not eat headroom a larger queued one waits on
+            _gate_q.pop(0)
+            _admit_locked(w)
+            admitted.append(w)
+    for w in admitted:
+        w.event.set()
+    if _costs_dirty:
+        _costs_dirty = False
+        save_costs()
+
+
+def gate_snapshot():
+    now = time.monotonic()
+    with _gate_lock:
+        return {
+            "queue": [{"model": w.model, "cost_mb": w.cost_mb,
+                       "waited": int(now - w.since)} for w in _gate_q],
+            "inflight": len(_gate_busy),
+            "stat": dict(_gate_stat),
+        }
+
+
+# ---------------------------------------------------------------- gate: proxy
+# Hop-by-hop headers plus the two we always recompute ourselves.
+HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+       "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
+
+# Metadata and model-management calls: no VRAM allocation, must never queue.
+UNGATED_PREFIX = ("/api/ps", "/api/tags", "/api/version", "/api/show", "/api/list",
+                  "/api/pull", "/api/push", "/api/copy", "/api/delete",
+                  "/api/create", "/api/blobs")
+
+# Calls that can trigger a model load.
+GATED_PATHS = ("/api/generate", "/api/chat", "/api/embed", "/api/embeddings",
+               "/v1/chat/completions", "/v1/completions", "/v1/embeddings")
+
+
+def _is_release(bj):
+    """keep_alive=0 means unload-now. These FREE VRAM, so queueing them behind a
+    wait-for-free-VRAM check would deadlock the only mechanism that produces it
+    (image-mode.bat, FreeVram.ps1)."""
+    if not isinstance(bj, dict) or "keep_alive" not in bj:
+        return False
+    return bj.get("keep_alive") in (0, 0.0, "0", "0s", "0m", "0h")
+
+
+def classify(path, bj):
+    p = path.split("?", 1)[0].rstrip("/") or "/"
+    if p.startswith(UNGATED_PREFIX):
+        return "ungated"
+    if p in GATED_PATHS:
+        return "release" if _is_release(bj) else "gated"
+    return "ungated"                              # unknown path -> fail open
+
+
+class _GateServer(ThreadingHTTPServer):
+    # Python sets SO_REUSEADDR by default. On Windows that lets a second
+    # process bind a port another process already owns - both sockets listen
+    # and delivery becomes undefined. Refuse, so a port clash is loud.
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+class GateHandler(BaseHTTPRequestHandler):
+    """Admission-controlling reverse proxy in front of Ollama.
+
+    Every GPU consumer except ComfyUI reaches the card through this, so holding a
+    request here is enough to keep ComfyUI from being paged out mid-generation.
+    """
+    protocol_version = "HTTP/1.1"
+    server_version   = "VRAMGate"
+
+    def log_message(self, *a):
+        pass
+
+    # ---- helpers
+    def _read_body(self):
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            buf = []
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    break
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                buf.append(self.rfile.read(size))
+                self.rfile.readline()
+            return b"".join(buf)
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _fail(self, code, msg):
+        body = json.dumps({"error": msg}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- verbs
+    def do_GET(self):     self._handle()
+    def do_POST(self):    self._handle()
+    def do_PUT(self):     self._handle()
+    def do_DELETE(self):  self._handle()
+    def do_HEAD(self):    self._handle()
+    def do_OPTIONS(self): self._handle()
+
+    def _handle(self):
+        self._sent = False
+        w = None
+        try:
+            body = self._read_body()
+            try:
+                bj = json.loads(body.decode("utf-8")) if body else None
+            except (ValueError, UnicodeDecodeError):
+                bj = None
+
+            if classify(self.path, bj) == "gated":
+                model = bj.get("model") if isinstance(bj, dict) else None
+                cost  = estimate_cost_mb(model)
+                if cost > 0:
+                    w = gate_acquire(model, cost)
+
+            self._forward(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass                                   # client walked away mid-stream
+        except Exception as exc:                   # the gate must never break traffic
+            if not self._sent:
+                try:
+                    self._fail(502, f"gate: {exc.__class__.__name__}: {exc}")
+                except OSError:
+                    pass
+        finally:
+            gate_release(w)
+
+    def _forward(self, body):
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        conn = http.client.HTTPConnection("127.0.0.1", OLLAMA_PORT,
+                                          timeout=GATE_CONNECT_TIMEOUT)
+        try:
+            conn.request(self.command, self.path, body=body or None, headers=hdrs)
+            # Connect timeout only. A 27B generation legitimately runs for minutes,
+            # so the read deadline has to be far looser than the connect one.
+            if conn.sock is not None:
+                conn.sock.settimeout(GATE_STREAM_TIMEOUT)
+            resp = conn.getresponse()
+
+            clen = resp.getheader("Content-Length")
+            self.send_response(resp.status)
+            self._sent = True
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP:
+                    self.send_header(k, v)
+
+            if self.command == "HEAD":
+                self.send_header("Content-Length", clen if clen is not None else "0")
+                self.end_headers()
+                return
+
+            # read1() returns as soon as any bytes are available; read() would block
+            # until the full buffer fills and turn token streaming into one late dump.
+            pump = getattr(resp, "read1", None) or resp.read
+
+            if clen is not None:
+                self.send_header("Content-Length", clen)
+                self.end_headers()
+                left = int(clen)
+                while left > 0:
+                    chunk = pump(min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                    self.wfile.write(chunk)
+                self.wfile.flush()
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                while True:
+                    chunk = pump(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n" % len(chunk))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()             # stream: never accumulate
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+        finally:
+            conn.close()
+
+
 # ---------------------------------------------------------------- web
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -360,6 +806,11 @@ table{width:100%;border-collapse:collapse}td{padding:4px 0;vertical-align:top}
 .ev{display:flex;gap:8px;padding:3px 0;border-top:1px solid #21262d;font-size:12.5px}
 .ev:first-child{border-top:0}.ev .t{color:var(--mut);flex:0 0 64px}.ev .k{flex:0 0 64px;font-weight:600}
 .k.LOAD{color:var(--grn)}.k.UNLOAD{color:var(--blu)}.k.WARN{color:var(--red)}.k.INFO{color:var(--mut)}
+.k.QUEUE{color:var(--amb)}.k.ADMIT{color:var(--grn)}
+.banner{background:#3a2a05;border:1px solid var(--amb);color:var(--amb);border-radius:7px;padding:9px 11px;margin-bottom:10px;font-size:12.5px}
+.queue{font-size:12.5px;color:var(--mut)}
+.qrow{display:flex;gap:8px;padding:3px 0;border-top:1px solid #21262d}
+.qrow:first-child{border-top:0}
 .ev .x{flex:1}.ev .d{color:var(--mut)}
 .foot{color:var(--mut);font-size:11px;text-align:center}
 .off-pill{color:var(--amb)}
@@ -380,7 +831,7 @@ letter-spacing:.06em;margin:0 0 10px;display:flex;align-items:center;gap:7px}
 h1 .modebtn{font:inherit;font-size:12px;color:var(--mut);background:transparent;border:1px solid var(--bd);
 border-radius:6px;padding:2px 9px;cursor:pointer;line-height:1.3}
 h1 .modebtn:hover{color:var(--fg);border-color:var(--blu)}
-body.mode-mini .card:not([data-sec=vram]){display:none}
+body.mode-mini .card:not([data-sec=vram]):not([data-sec=gate]){display:none}
 body.mode-bar .card{display:none}
 </style></head><body><div class=wrap>
 <h1><span>VRAM Monitor <span class=gpu>RTX 3090 · 24 GB</span></span>
@@ -395,6 +846,14 @@ body.mode-bar .card{display:none}
       <span>GPU util <b id=s_util>–</b></span>
       <span id=s_comfy></span>
     </div>
+  </div>
+</div>
+<div class=card data-sec=gate>
+  <p class=hd onclick="toggleSec('gate')"><span class=cv>&#9662;</span> Gate <span id=g_pill></span></p>
+  <div class=bd>
+    <div id=banner class=banner style=display:none></div>
+    <div id=queue class=queue></div>
+    <div class=sub><span>In flight <b id=g_inf>-</b></span><span>Held <b id=g_q>-</b></span><span>Forced <b id=g_f>-</b></span></div>
   </div>
 </div>
 <div class=card data-sec=ctl>
@@ -461,6 +920,24 @@ async function tick(){
   $('#s_oll').textContent=gb(d.ollama_mb);$('#s_oth').textContent=gb(d.other_mb);
   $('#s_util').textContent=d.util!=null?d.util+'%':'–';
   $('#s_comfy').innerHTML=d.comfy?'<b style=color:var(--blu)>ComfyUI on GPU</b>':'';
+  // gate
+  const g=d.gate||{queue:[],inflight:0,stat:{}};const gs=g.stat||{};
+  $('#g_inf').textContent=g.inflight||0;
+  $('#g_q').textContent=gs.queued||0;
+  $('#g_f').textContent=gs.forced||0;
+  const q=$('#queue');
+  if(!g.queue.length){q.textContent='nothing waiting';}
+  else{q.innerHTML='';for(const w of g.queue){const r=document.createElement('div');
+    r.className='qrow';
+    r.innerHTML=`<span style=flex:1>${w.model}</span>`+
+      `<span class=rt>${gb(w.cost_mb)}</span><span class=rt>${w.waited}s</span>`;
+    q.appendChild(r);}}
+  $('#g_pill').innerHTML=g.queue.length?
+    '<span style=color:var(--amb)>&#9679; '+g.queue.length+' waiting</span>':'';
+  const bn=$('#banner');
+  if(d.banner){bn.style.display='';
+    bn.innerHTML=d.banner+' <button onclick="act(\'stop_llms\')">Evict LLMs</button>';}
+  else bn.style.display='none';
   // controls
   const bi=$('#b_idle');bi.textContent='Auto-unload: '+(d.auto_unload?'ON':'OFF');
   bi.className=d.auto_unload?'on':'off';
@@ -551,9 +1028,27 @@ def _tailscale_ip():
 
 
 def main():
+    known = load_costs()
     threading.Thread(target=poll_loop, daemon=True).start()
+
+    try:
+        gate_srv = _GateServer((GATE_HOST, GATE_PORT), GateHandler)
+    except OSError as exc:
+        # Dashboard still works; say plainly that nothing is being gated.
+        gate_srv = None
+        log_event("WARN", "gate NOT started",
+                  f":{GATE_PORT} is already in use - is Ollama still on it? ({exc})")
+    else:
+        threading.Thread(target=gate_srv.serve_forever, daemon=True).start()
+        log_event("INFO", "gate started",
+                  f":{GATE_PORT} -> :{OLLAMA_PORT}, {known} model costs known")
+
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print("VRAM Monitor running:")
+    if gate_srv is not None:
+        print(f"  gate  : http://localhost:{GATE_PORT}  ->  ollama :{OLLAMA_PORT}")
+    else:
+        print(f"  gate  : NOT RUNNING - port {GATE_PORT} already in use")
     print(f"  local : http://localhost:{PORT}")
     lan = _lan_ip()
     if lan:

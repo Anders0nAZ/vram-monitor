@@ -5,3 +5,12 @@
 .claude/
 __pycache__/
 *.pyc
+
+# learned per-model VRAM costs (machine-specific runtime state)
+model-costs.json
+
+# learned per-task run durations (machine-specific runtime state)
+job-history.json
+
+# editor backups
+*.bak
