@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
+import schedule                                 # look-ahead calendar (/schedule)
+
 # ---------------------------------------------------------------- config
 PORT          = 11435                       # dashboard at http://<host>:11435
 HOST          = "0.0.0.0"                   # 0.0.0.0 = reachable from phone (LAN/Tailscale)
@@ -339,6 +341,7 @@ def poll_loop():
                 "comfy_idle_s": idle_s,
                 "comfy_freed": _ctl["comfy_freed"],
                 "last_free": _ctl["last_free"],
+                "next_job": schedule.next_job_summary(),
                 "events": list(_events)[:60],
             })
         time.sleep(POLL_SECONDS)
@@ -474,6 +477,20 @@ def _tag_sizes():
 def _resident():
     with _lock:
         return {_norm_model(m["name"]) for m in _state.get("models", [])}
+
+
+def _resident_rows():
+    """Resident models with sizes and keep-alive, for the schedule forecast.
+    It needs the decay - a model resident now is gone by the time its keep-alive
+    expires, and a 24h look-ahead must not assume it holds forever."""
+    with _lock:
+        return [dict(m) for m in _state.get("models", [])]
+
+
+def _board_snapshot():
+    with _lock:
+        return {"used_mb": _state.get("used_mb"), "total_mb": _state.get("total_mb"),
+                "other_mb": _state.get("other_mb")}
 
 
 def estimate_cost_mb(model):
@@ -846,6 +863,7 @@ body.mode-bar .card{display:none}
       <span>GPU util <b id=s_util>–</b></span>
       <span id=s_comfy></span>
     </div>
+    <div class=sub><span id=s_next></span></div>
   </div>
 </div>
 <div class=card data-sec=gate>
@@ -920,6 +938,13 @@ async function tick(){
   $('#s_oll').textContent=gb(d.ollama_mb);$('#s_oth').textContent=gb(d.other_mb);
   $('#s_util').textContent=d.util!=null?d.util+'%':'–';
   $('#s_comfy').innerHTML=d.comfy?'<b style=color:var(--blu)>ComfyUI on GPU</b>':'';
+  const nj=d.next_job;
+  $('#s_next').innerHTML=nj
+    ? 'next <b>'+nj.task+'</b> in <b>'+(nj.in_s<90?Math.round(nj.in_s)+'s'
+        :nj.in_s<5400?Math.round(nj.in_s/60)+'m':(nj.in_s/3600).toFixed(1)+'h')+'</b>'
+      +(nj.peak_mb?' · needs <b>'+gb(nj.peak_mb)+'</b>':'')
+      +' <a href="/schedule" style="color:var(--blu)">schedule &rarr;</a>'
+    : '<a href="/schedule" style="color:var(--blu)">schedule &rarr;</a>';
   // gate
   const g=d.gate||{queue:[],inflight:0,stat:{}};const gs=g.stat||{};
   $('#g_inf').textContent=g.inflight||0;
@@ -984,6 +1009,20 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 body = json.dumps(_state).encode()
             self._send(body, "application/json")
+        elif self.path.startswith("/api/schedule"):
+            hours = 6
+            q = self.path.partition("?")[2]
+            for part in q.split("&"):
+                k, _, v = part.partition("=")
+                if k == "hours" and v.isdigit():
+                    hours = int(v)
+            try:
+                body = json.dumps(schedule.forecast(hours)).encode()
+            except Exception as exc:             # a bad forecast must not 500 the dashboard
+                body = json.dumps({"ok": False, "msg": f"forecast failed: {exc!r}"}).encode()
+            self._send(body, "application/json")
+        elif self.path.startswith("/schedule"):
+            self._send(schedule.SCHED_PAGE.encode(), "text/html; charset=utf-8")
         else:
             self._send(PAGE.encode(), "text/html; charset=utf-8")
 
@@ -1031,6 +1070,9 @@ def main():
     known = load_costs()
     threading.Thread(target=poll_loop, daemon=True).start()
 
+    schedule.set_hooks(resident=_resident_rows, board=_board_snapshot, log=log_event)
+    schedule.start()
+
     try:
         gate_srv = _GateServer((GATE_HOST, GATE_PORT), GateHandler)
     except OSError as exc:
@@ -1050,6 +1092,7 @@ def main():
     else:
         print(f"  gate  : NOT RUNNING - port {GATE_PORT} already in use")
     print(f"  local : http://localhost:{PORT}")
+    print(f"  sched : http://localhost:{PORT}/schedule")
     lan = _lan_ip()
     if lan:
         print(f"  LAN   : http://{lan}:{PORT}")

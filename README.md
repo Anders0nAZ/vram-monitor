@@ -25,6 +25,8 @@ Stdlib only. No pip install, no framework, no config file.
   VRAM actually exists rather than letting the driver page someone else out.
 - Exposes manual controls — free ComfyUI now, stop LLMs, toggle auto-unload,
   quit — so it can run hidden at login with no console window.
+- **Projects the next 6/12/24 hours of scheduled work** at `/schedule`, so a
+  collision is something you see coming rather than something you find in the log.
 
 ## The interesting part: you cannot measure this directly on Windows
 
@@ -122,6 +124,68 @@ logged loudly as `gate NOT started` instead of silently half-working. A direct
 `serve` still loads models 100% onto the GPU; the tray app is not needed for CUDA
 discovery.
 
+## The look-ahead calendar
+
+The gate solves contention after it happens: a request arrives, there is no room,
+it waits. `/schedule` is the other half — seeing it coming.
+
+It reads Windows Task Scheduler (one `schtasks /query /xml ONE` call, ~120 ms,
+refreshed every 5 minutes), expands each trigger into concrete future runs, and
+draws them as a meeting-scheduler grid: time down the side, 30-minute slots,
+lanes for GPU-heavy / GPU-light / CPU / always-on, and a VRAM spine down the left
+showing the projected board load per slot.
+
+Three things get joined together:
+
+| Question | Source |
+|---|---|
+| When does it run? | Task Scheduler triggers, expanded locally |
+| What does it do? | The task's own `<Description>` — already written, just unused |
+| What does it cost? | `jobs.json` names the models; `model-costs.json` prices them |
+| How long does it take? | Learned. Seeded from `jobs.json`, refined from observation |
+
+**Shared models are counted once.** Two jobs that both want
+`qwen3.8:27b-mtp-96k` do not need 34 GB — Ollama holds one copy. Slot cost is the
+union of model names, not the sum of per-job footprints. Getting this wrong would
+invent collisions that cannot happen.
+
+**The baseline is usually the deciding term.** On 2026-09-09 the gate
+force-admitted a 0.3 GB embedding because the board sat at 23.1/24.0 GB: a 16.5 GB
+model plus ~6.6 GB of *non-Ollama* VRAM. Job-versus-job arithmetic says that
+morning fit comfortably. So the forecast starts from what is resident now — each
+model until its keep-alive expires, and non-Ollama VRAM for a
+`OTHER_HOLD_SECONDS` assumption — and stacks scheduled work on top of that.
+
+**Durations are learned, at ±15 s.** The `TaskScheduler/Operational` event log is
+disabled on most machines, so there are no start/stop events to read. Instead the
+status poll times `Ready → Running → Ready` itself and keeps a rolling median in
+`job-history.json`; the UI says `measured, n=7` once it has enough runs and
+`estimated` until then. A median, not a high-water mark — unlike VRAM cost,
+over-estimating a duration is not the safe direction, it just paints phantom
+collisions across the calendar.
+
+Jobs repeating more than a handful of times in the window (a 15-minute watchdog is
+96 runs a day) collapse into one "every 15m" cadence band instead of 96 blocks.
+
+To add a job, drop a block into `jobs.json` — `match` (or a `regex`), `lane`,
+`models`, `seed_seconds`. A task with no entry stays off the calendar entirely.
+Anything self-registering can be matched by pattern: `NFLModelCapture_\d{8}_\d{4}`
+picks up the one-shot pre-kickoff captures that appear during the day.
+
+It is strictly **read-only** — it never creates, edits, enables or runs a task.
+
+```sh
+python schedule.py --dump --hours 24            # expanded occurrences, as text
+python schedule.py --dump --now 2026-09-15T08:00  # check a weekly trigger's day
+```
+
+### What it cannot see
+
+Ad-hoc load. `vram-monitor.log` shows `qwen3:1.7b` and `qwen3:30b-a3b` loading at
+times matching no scheduled task — Open WebUI, OpenHands, or an editor
+integration. Nothing schedules those, so nothing can forecast them; they show up
+as the gap between the projection and what actually happened.
+
 ## Requirements
 
 - Windows with an NVIDIA GPU (`nvidia-smi` on `PATH`)
@@ -137,8 +201,9 @@ discovery.
 python vram_monitor.py
 ```
 
-Then open <http://localhost:11435>. The console also prints your LAN and
-Tailscale URLs if available, so the dashboard is reachable from a phone.
+Then open <http://localhost:11435>, or <http://localhost:11435/schedule> for the
+look-ahead calendar. The console also prints your LAN and Tailscale URLs if
+available, so both are reachable from a phone.
 
 `Start-VRAMMonitor.bat` starts the server and opens the dashboard in a compact
 always-on-top Chrome window. `Start-ComfyIdleUnload.bat` runs only the ComfyUI
@@ -171,6 +236,20 @@ Constants at the top of `vram_monitor.py`:
 | `RESERVE_TTL` | `25` | Seconds an admitted allocation stays reserved |
 | `BIG_MODEL_MB` | `6000` | Resident size that triggers the ComfyUI banner |
 | `COST_FILE` | `model-costs.json` | Learned per-model VRAM costs |
+
+Constants at the top of `schedule.py`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `JOBS_FILE` | `jobs.json` | Which models each task loads, and its seed duration |
+| `HIST_FILE` | `job-history.json` | Learned run durations (generated) |
+| `DEFS_SECONDS` | `300` | Task-definition refresh interval |
+| `STATUS_SECONDS` | `15` | Status poll — also the duration resolution |
+| `SLOT_MINUTES` | `30` | Calendar granularity |
+| `MIN_SAMPLES` | `3` | Observed runs before a median beats the seed |
+| `HIST_KEEP` | `20` | Durations retained per task |
+| `OTHER_HOLD_SECONDS` | `1800` | How long non-Ollama VRAM is assumed to keep holding |
+| `MAX_OCC` | `400` | Per-trigger expansion guard |
 
 ## Notes
 
