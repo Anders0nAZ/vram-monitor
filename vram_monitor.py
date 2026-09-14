@@ -42,7 +42,12 @@ COMFY_HINT    = "comfyui"                    # substring (lowercase) marking Com
 IDLE_MINUTES  = 5                            # auto-free ComfyUI after this long idle
 AUTO_UNLOAD   = True                         # default state of the idle watchdog
 OTHER_DELTA_MB = 400                         # min change in "other" VRAM to log as an event
-LOG_FILE      = "vram-monitor.log"
+
+# Anchor data files to this script, never the working directory. The launcher
+# starts us with no workdir set, so we inherit ITS cwd - and a relative path then
+# silently reads and writes a different set of files somewhere else.
+APP_DIR       = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE      = os.path.join(APP_DIR, "vram-monitor.log")
 LOG_MAX_BYTES = 2_000_000
 EVENTS_KEEP   = 250
 SETTLE_CYCLES = 4        # polls to suppress "other" attribution after an ollama load/unload
@@ -54,7 +59,7 @@ GATE_PORT     = 11434
 RESERVE_MB    = 1024                         # headroom never handed out
 MAX_HOLD_SECONDS = 120                       # under the historian 240s timeout
 RESERVE_TTL   = 25                           # secs an admitted alloc stays reserved
-COST_FILE     = "model-costs.json"
+COST_FILE     = os.path.join(APP_DIR, "model-costs.json")
 DEFAULT_COST_MB = 4096                       # unknown model
 COST_FALLBACK_FACTOR = 1.2                   # disk size -> vram estimate
 BIG_MODEL_MB  = 6000                         # banner threshold while ComfyUI runs

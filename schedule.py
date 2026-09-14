@@ -26,9 +26,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------- config
-JOBS_FILE     = "jobs.json"
-HIST_FILE     = "job-history.json"
-COST_FILE     = "model-costs.json"
+# Anchor to this script, never the working directory. Python puts the script's
+# own directory on sys.path, so `import schedule` works from anywhere - but a
+# relative data path does not, and jobs.json is required input. Read from the
+# wrong cwd it yields zero tracked jobs and a silently empty calendar.
+APP_DIR       = os.path.dirname(os.path.abspath(__file__))
+JOBS_FILE     = os.path.join(APP_DIR, "jobs.json")
+HIST_FILE     = os.path.join(APP_DIR, "job-history.json")
+COST_FILE     = os.path.join(APP_DIR, "model-costs.json")
 
 DEFS_SECONDS   = 300      # bulk task-definition refresh (schtasks /query /xml ONE)
 STATUS_SECONDS = 15       # live status poll (schtasks /query /fo CSV)
@@ -292,6 +297,16 @@ def refresh_definitions():
         _log("WARN", "schedule: task XML unparseable", str(exc))
         return 0
 
+    manifest = _manifest()
+    if not manifest.get("jobs"):
+        # Silence here is what made a misconfigured launch look like "nothing
+        # scheduled today" for three days. Say which file, and where.
+        _log("WARN", "schedule: no jobs configured", f"cannot read {JOBS_FILE}")
+        with _lock:
+            _warn[:] = [f"jobs.json is empty or unreadable at {JOBS_FILE} - "
+                        f"nothing can be forecast until it loads"]
+        return 0
+
     found, unsupported = {}, set()
     for task in root:
         uri = _t(task, "RegistrationInfo", "URI") or ""
@@ -537,7 +552,9 @@ def forecast(hours=6, now=None):
         status = {k: dict(v) for k, v in _status.items()}
         warns = list(_warn)
     if not defs:
-        return {"ok": False, "msg": "no task definitions yet", "hours": hours,
+        msg = warns[0] if warns else (
+            "no task definitions yet - the first schtasks query has not returned")
+        return {"ok": False, "msg": msg, "hours": hours,
                 "origin": origin.isoformat(timespec="seconds"), "blocks": [],
                 "slots": [], "warnings": warns}
 
