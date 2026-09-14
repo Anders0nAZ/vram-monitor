@@ -39,7 +39,10 @@ DEFS_SECONDS   = 300      # bulk task-definition refresh (schtasks /query /xml O
 STATUS_SECONDS = 15       # live status poll (schtasks /query /fo CSV)
 VERBOSE_EVERY  = 20       # every Nth status poll, use /v for last run + result
 
-SLOT_MINUTES   = 30       # calendar granularity
+# Chart granularity, per window. Finer slots on a short window keep a 20-second
+# job from being drawn as though it occupied half an hour.
+SLOT_MINUTES   = 30       # fallback / origin rounding
+SLOT_FOR_HOURS = {6: 10, 12: 15, 24: 30}
 MAX_OCC        = 400      # per-trigger runaway guard
 HIST_KEEP      = 20       # observed durations retained per task
 MIN_SAMPLES    = 3        # before a learned median beats the seed
@@ -197,6 +200,31 @@ def _norm_model(name):
     if not name:
         return None
     return name if ":" in name else name + ":latest"
+
+
+def _is_model(name):
+    """Real model names always carry a :tag. The baseline residual does not."""
+    return bool(name) and ":" in name and not name.startswith("other")
+
+
+def _palette_order():
+    """Stable colour order for models, derived from jobs.json alone.
+
+    Colour must follow the entity, not its rank in whatever happens to be on
+    screen. Indexing into the models present in the current window would repaint
+    every survivor each time the 6/12/24h toggle changed the set - qwen3.8 blue
+    at 6h and green at 24h. This order depends only on the manifest, so a model
+    keeps its hue across windows, across days, and across restarts.
+    """
+    m = _manifest()
+    out = []
+    for group in ("jobs", "daemons"):
+        for entry in m.get(group, []):
+            for name in (entry.get("models") or []):
+                key = _norm_model(name)
+                if key and key not in out:
+                    out.append(key)
+    return out
 
 
 def cost_static_mb(model):
@@ -605,10 +633,12 @@ def forecast(hours=6, now=None):
                 "limit_s": d.get("limit_s"),
             })
 
-    # --- 30-min rollup. A model held by two concurrent jobs is ONE copy in VRAM,
-    # so slot cost is the union of model names, not the sum of per-job peaks.
+    # --- rollup. A model held by two concurrent jobs is ONE copy in VRAM, so slot
+    # cost is the union of model names, not the sum of per-job peaks. The chart
+    # plots VRAM on the y-axis, and what occupies VRAM is models - so each slot
+    # carries its per-model breakdown, which is what gets stacked.
     slots, collisions = [], []
-    step = SLOT_MINUTES * 60
+    step = SLOT_FOR_HOURS.get(hours, SLOT_MINUTES) * 60
     for i in range(int(hours * 3600 // step)):
         s0, s1 = i * step, (i + 1) * step
         # Baseline first: whatever is still holding when this slot starts. Keyed by
@@ -638,6 +668,8 @@ def forecast(hours=6, now=None):
         slots.append({"off_s": s0,
                       "t": (origin + timedelta(seconds=s0)).isoformat(timespec="minutes"),
                       "mb": mb, "jobs": jobs, "n": len(jobs), "runs": runs,
+                      "parts": dict(sizes),
+                      "held": sorted(set(held)),
                       "base_mb": sum(v for k, v in sizes.items() if k in held),
                       "contended": contended})
         if contended:
@@ -663,6 +695,22 @@ def forecast(hours=6, now=None):
         c.pop("_next_off", None)
     collisions = merged
 
+    # --- stacking series. Colour is assigned by model NAME, not by size or rank,
+    # so a model keeps its hue when the set around it changes. "other" is the
+    # unattributed residual, not an identity, so it takes the neutral and always
+    # sits at the bottom of the stack.
+    names = {n for s in slots for n in s["parts"]}
+    other = sorted(n for n in names if not _is_model(n))
+    models = sorted(n for n in names if _is_model(n))
+    universe = _palette_order()
+    series = [{"name": n, "slot": -1, "kind": "other"} for n in other]
+    series += [{"name": n,
+                "slot": (universe.index(n) if n in universe
+                         else len(universe) + sorted(names).index(n)) % 6,
+                "kind": "model"} for n in models]
+    for s in series:
+        s["peak_mb"] = max((sl["parts"].get(s["name"], 0) for sl in slots), default=0)
+
     upcoming = sorted((b for b in blocks if not b["ambient"] and b["off_s"] >= 0),
                       key=lambda b: b["off_s"])
     nxt = next((b for b in upcoming if b["off_s"] >= now_off), None)
@@ -679,6 +727,8 @@ def forecast(hours=6, now=None):
         "baseline": base,
         "daemons": _manifest().get("daemons", []),
         "lanes": _manifest().get("lanes", []),
+        "series": series,
+        "slot_minutes": step // 60,
         "blocks": blocks,
         "slots": slots,
         "collisions": collisions,
@@ -747,7 +797,14 @@ SCHED_PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Stack Schedule</title><style>
 :root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;
---grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--pxh:110px}
+--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;
+/* Categorical slots: the validated dark-mode palette, checked against this
+   card surface (#161b22) - worst adjacent CVD dE 8.4, all six >=3:1 contrast.
+   Assigned by model NAME so a model keeps its hue as the set changes. */
+--s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;--s4:#d55181;--s5:#9085e9;
+--other:#6e7681;                       /* unattributed residual, not an identity */
+--crit:#d03b3b;--warnc:#fab219;        /* status - never reused for a series */
+--grid:#21262d;--plot-h:300px}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
 font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:14px}
 .wrap{max-width:1180px;margin:0 auto}
@@ -756,7 +813,6 @@ align-items:baseline;gap:12px;flex-wrap:wrap}
 h1 .gpu{color:var(--mut);font-weight:400}
 a{color:var(--blu);text-decoration:none}a:hover{text-decoration:underline}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px}
-.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
 .btns{display:flex;gap:6px}
 button{font:inherit;font-size:12.5px;color:var(--fg);background:#21262d;border:1px solid var(--bd);
 border-radius:7px;padding:6px 12px;cursor:pointer}
@@ -764,275 +820,301 @@ button:hover{border-color:var(--blu)}
 button.on{border-color:var(--blu);color:var(--blu)}
 .sum{color:var(--mut);font-size:12.5px;display:flex;gap:18px;flex-wrap:wrap}
 .sum b{color:var(--fg);font-weight:600}
-.sum b.bad{color:var(--red)}.sum b.warn{color:var(--amb)}
+.sum b.bad{color:var(--crit)}.sum b.warn{color:var(--amb)}
 .banner{background:#3a2a05;border:1px solid var(--amb);color:var(--amb);border-radius:7px;
 padding:9px 11px;margin-bottom:12px;font-size:12.5px}
-.banner.bad{background:#3d1417;border-color:var(--red);color:var(--red)}
+.banner.bad{background:#3d1417;border-color:var(--crit);color:#ff9a9a}
 .lbl{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px}
+.hint{color:var(--mut)}
 
-.grid{display:grid;grid-template-columns:52px 40px repeat(4,minmax(0,1fr));gap:0;
-border:1px solid var(--bd);border-radius:8px;overflow:hidden;background:#10151c}
-.hdr{grid-column:1/-1;display:grid;grid-template-columns:subgrid;border-bottom:1px solid var(--bd)}
-.hdr>div{padding:6px 8px;font-size:11px;color:var(--mut);text-transform:uppercase;
-letter-spacing:.05em;border-left:1px solid var(--bd);white-space:nowrap;overflow:hidden}
-.hdr>div:first-child,.hdr>div:nth-child(2){border-left:0}
-.col{position:relative;height:var(--h);border-left:1px solid var(--bd)}
-.col.gut,.col.spine{border-left:0}
-.col.lanes{background-image:repeating-linear-gradient(to bottom,
-  transparent 0,transparent calc(var(--pxh)/2 - 1px),#1b222c calc(var(--pxh)/2 - 1px),#1b222c calc(var(--pxh)/2)),
-  repeating-linear-gradient(to bottom,transparent 0,transparent calc(var(--pxh) - 1px),#262d38 calc(var(--pxh) - 1px),#262d38 var(--pxh))}
-.hr{position:absolute;left:0;right:4px;text-align:right;color:var(--mut);font-size:11px;
-padding-right:5px;transform:translateY(-1px)}
-.hr.day{color:var(--blu)}
-.now{position:absolute;left:0;right:0;height:0;border-top:1px solid var(--red);z-index:6;pointer-events:none}
-.now:after{content:'now';position:absolute;left:2px;top:-13px;font-size:10px;color:var(--red);background:var(--bg);padding:0 3px}
+/* ---- legend: identity is never colour-alone, so every swatch carries its name ---- */
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;font-size:12px}
+.lg{display:flex;align-items:center;gap:6px;color:var(--mut)}
+.lg i{width:11px;height:11px;border-radius:3px;display:inline-block;flex:none}
+.lg b{color:var(--fg);font-weight:600}
 
-.slot{position:absolute;left:3px;right:3px;border-radius:2px}
-.slot.ok{background:rgba(63,185,80,.30)}
-.slot.mid{background:rgba(210,153,34,.38)}
-.slot.bad{background:rgba(248,81,73,.55)}
+/* ---- chart ---- */
+.chart{display:grid;grid-template-columns:54px minmax(0,1fr);gap:0}
+.yax{position:relative;height:var(--plot-h)}
+.yax span{position:absolute;right:8px;transform:translateY(-50%);color:var(--mut);font-size:11px;white-space:nowrap}
+.plot{position:relative;height:var(--plot-h);border-left:1px solid var(--bd);
+border-bottom:1px solid var(--bd);overflow:hidden}
+.gl{position:absolute;left:0;right:0;height:1px;background:var(--grid)}
+.over{position:absolute;left:0;right:0;top:0;background:rgba(208,59,59,.10)}
+.thresh{position:absolute;left:0;right:0;height:0;border-top:1px dashed var(--crit)}
+.thresh:after{content:attr(data-l);position:absolute;right:3px;top:-15px;font-size:10px;
+color:var(--crit);background:var(--card);padding:0 4px}
+.col{position:absolute;bottom:0;top:0}
+.seg{position:absolute;left:1px;right:1px;border-radius:2px}
+.rug{position:absolute;top:0;height:3px;background:var(--crit)}
+.nowl{position:absolute;top:0;bottom:0;width:0;border-left:1px solid var(--red);z-index:4}
+.nowl:after{content:'now';position:absolute;left:3px;top:1px;font-size:10px;color:var(--red);
+background:var(--card);padding:0 3px}
+.xax{position:relative;height:20px;margin-left:54px;margin-top:4px}
+.xax span{position:absolute;transform:translateX(-50%);color:var(--mut);font-size:11px;white-space:nowrap}
+.cpu{position:relative;height:22px;margin-left:54px;border-top:1px solid var(--grid);margin-top:2px}
+.cpu i{position:absolute;top:6px;width:2px;height:8px;background:var(--mut);display:block}
+.cpu em{position:absolute;top:4px;left:0;font-style:normal;color:var(--mut);font-size:10.5px}
 
-.blk{position:absolute;border-radius:5px;padding:2px 5px;overflow:hidden;cursor:pointer;
-border:1px solid;font-size:11.5px;line-height:1.25;z-index:2}
-.blk:hover{filter:brightness(1.25)}
-.blk.sel{outline:2px solid var(--blu);outline-offset:-1px;z-index:5}
-.blk .n{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
-.blk .m{color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
-.blk.band .n,.blk.band .m{white-space:normal;overflow-wrap:anywhere;line-height:1.2}
-.blk.heavy{background:#3d1417;border-color:#7d2b30;color:#ffb3ae}
-.blk.light{background:#3a2a05;border-color:#7a5c12;color:#f0c874}
-.blk.cpu{background:#12262e;border-color:#245868;color:#8fd3e8}
-.blk.amb{background:#1c2128;border-color:#30363d;color:var(--mut)}
-.blk.band{background-image:repeating-linear-gradient(45deg,transparent 0 7px,rgba(255,255,255,.045) 7px 14px);
-opacity:.85}
-.blk.band .m{position:sticky;top:0}
-.blk.run{border-color:var(--grn);box-shadow:0 0 0 1px var(--grn) inset}
-.chip{display:inline-block;background:rgba(0,0,0,.35);border-radius:3px;padding:0 4px;margin-left:4px}
+/* ---- tooltip ---- */
+.tip{position:fixed;z-index:50;background:#0d1117;border:1px solid var(--bd);border-radius:7px;
+padding:8px 10px;font-size:12px;pointer-events:none;display:none;box-shadow:0 6px 20px rgba(0,0,0,.6);
+max-width:290px}
+.tip .h{font-weight:600;margin-bottom:5px}
+.tip .r{display:flex;gap:8px;align-items:center;color:var(--mut)}
+.tip .r i{width:9px;height:9px;border-radius:2px;flex:none}
+.tip .r b{color:var(--fg);margin-left:auto;font-weight:600}
+.tip .tot{border-top:1px solid var(--grid);margin-top:5px;padding-top:5px}
 
-/* Sticky: a 24h grid is ~1050px tall, so a panel parked under it would never
-   be on screen at the moment you click a block. */
-.det{min-height:74px;position:sticky;bottom:10px;z-index:20;
-box-shadow:0 6px 22px rgba(0,0,0,.65)}
+/* ---- upcoming table (also the table view for the chart) ---- */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;color:var(--mut);font-weight:400;font-size:11px;text-transform:uppercase;
+letter-spacing:.06em;padding:0 8px 6px 0;border-bottom:1px solid var(--grid)}
+td{padding:5px 8px 5px 0;border-top:1px solid var(--grid);vertical-align:top}
+tr.j{cursor:pointer}tr.j:hover td{background:#1c2128}
+tr.j.sel td{background:#1c2128;box-shadow:inset 2px 0 0 var(--blu)}
+td.n{font-weight:600}
+td.r{text-align:right;color:var(--mut);white-space:nowrap}
+.sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:baseline}
+.tight{color:var(--crit)}
+
+.det{min-height:74px;position:sticky;bottom:10px;z-index:20;box-shadow:0 6px 22px rgba(0,0,0,.65)}
 .det .t{font-size:14px;font-weight:600;margin:0 0 6px}
 .det .meta{color:var(--mut);display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px;font-size:12px}
 .det .meta b{color:var(--fg);font-weight:600}
 .det p{margin:0 0 7px}
 .det .note{color:var(--mut);border-left:2px solid var(--bd);padding-left:9px}
 .det .cmd{color:var(--mut);font-size:11.5px;word-break:break-all}
-.hint{color:var(--mut)}
-
-.list{display:none}
-.li{border-top:1px solid #21262d;padding:8px 0;cursor:pointer}
-.li:first-child{border-top:0}
-.li .top{display:flex;gap:10px;align-items:baseline}
-.li .tm{color:var(--mut);flex:0 0 52px}
-.li .nm{font-weight:600;flex:1}
-.li .mb{color:var(--mut)}
-.li .d{color:var(--mut);font-size:12px;padding-left:62px}
-.li.bad .nm{color:var(--red)}
 .foot{color:var(--mut);font-size:11px;text-align:center;margin-top:4px}
 @media(max-width:820px){
-  .grid{display:none}
-  .list{display:block}
+  :root{--plot-h:220px}
   body{padding:10px}
+  .chart{grid-template-columns:42px minmax(0,1fr)}
+  .xax,.cpu{margin-left:42px}
+  td.hide,th.hide{display:none}
 }
 </style></head><body><div class=wrap>
 
-<h1><span>Stack Schedule <span class=gpu id=gpu>–</span></span>
+<h1><span>Stack Schedule <span class=gpu id=gpu>&ndash;</span></span>
   <span class=btns>
     <button data-h=6 onclick="setWin(6)">6h</button>
     <button data-h=12 onclick="setWin(12)">12h</button>
     <button data-h=24 onclick="setWin(24)">24h</button>
-    <a href="/" style="align-self:center;margin-left:6px">monitor →</a>
+    <a href="/" style="align-self:center;margin-left:6px">monitor &rarr;</a>
   </span></h1>
 
 <div id=banners></div>
 
 <div class=card>
   <div class=sum id=sum></div>
-  <p class=lbl style="margin:11px 0 6px">held now — every job has to fit around this</p>
+  <p class=lbl style="margin:11px 0 6px">held now &mdash; every job has to fit around this</p>
   <div class=sum id=base></div>
 </div>
 
-<div class=card style="padding:0;overflow:hidden">
-  <div class=grid id=grid></div>
-  <div class=list id=list></div>
+<div class=card>
+  <div class=legend id=legend></div>
+  <div class=chart>
+    <div class=yax id=yax></div>
+    <div class=plot id=plot></div>
+  </div>
+  <div class=xax id=xax></div>
+  <div class=cpu id=cpu></div>
 </div>
 
-<div class="card det" id=det><p class=hint>Pick a block to see what it does.</p></div>
-<p class=foot id=foot>–</p>
+<div class=card>
+  <p class=lbl>upcoming runs</p>
+  <div id=table></div>
 </div>
+
+<div class="card det" id=det><p class=hint>Pick a run to see what it does.</p></div>
+<p class=foot id=foot>&ndash;</p>
+</div>
+<div class=tip id=tip></div>
 <script>
 const $=s=>document.querySelector(s);
-const PXH={6:110,12:70,24:44}, DENSE=5;   // >DENSE runs in the window -> cadence band
+const DENSE=5;
 let WIN=+(localStorage.getItem('sched_win')||6), DATA=null, SEL=null;
-if(!PXH[WIN])WIN=6;
+if(![6,12,24].includes(WIN))WIN=6;
 
-const LANES=[['gpu-heavy','GPU heavy','heavy'],['gpu-light','GPU light','light'],
-             ['cpu','CPU / net','cpu'],['always-on','Always on','amb']];
-
-function gb(mb){return mb>=1024?(mb/1024).toFixed(1)+'GB':mb+'MB';}
+function gb(mb){return mb>=1024?(mb/1024).toFixed(1)+'GB':Math.round(mb)+'MB';}
 function dur(s){s=Math.round(s);if(s<60)return s+'s';
   if(s<3600)return Math.round(s/60)+'m';
   const h=Math.floor(s/3600),m=Math.round((s%3600)/60);return m?h+'h'+m+'m':h+'h';}
 function hhmm(iso){return iso?iso.slice(11,16):'';}
 function esc(t){const d=document.createElement('div');d.textContent=t==null?'':t;return d.innerHTML;}
-
 function setWin(h){WIN=h;localStorage.setItem('sched_win',h);tick();}
 
-/* Overlapping runs in one lane get side-by-side sub-columns, like a day view. */
-function pack(bs){
-  const cols=[];
-  bs.sort((a,b)=>a.off_s-b.off_s).forEach(b=>{
-    const end=b.off_s+Math.max(b.dur_s,180);
-    let i=cols.findIndex(c=>c<=b.off_s);
-    if(i<0){i=cols.length;cols.push(end);}else cols[i]=end;
-    b._c=i;
-  });
-  bs.forEach(b=>b._n=cols.length);
-  return bs;
-}
+/* Colour follows the entity: the server assigns a slot per model name, so a
+   model keeps its hue when other series appear or vanish. */
+function colour(s){return s.kind==='other'?'var(--other)':'var(--s'+s.slot+')';}
 
 function render(d){
-  const pxh=PXH[d.hours], H=pxh*d.hours;
-  document.documentElement.style.setProperty('--pxh',pxh+'px');
+  const T=d.total_mb||24576, U=d.usable_mb, span=d.hours*3600;
+  const byName={}; d.series.forEach(s=>byName[s.name]=s);
+  const pct=mb=>mb/T*100;
 
   document.querySelectorAll('.btns button').forEach(b=>
     b.classList.toggle('on',+b.dataset.h===d.hours));
+  $('#gpu').textContent=(d.used_mb!=null?gb(d.used_mb)+' / ':'')+gb(T)
+    +' · '+gb(U)+' usable';
 
-  $('#gpu').textContent=(d.used_mb!=null?gb(d.used_mb)+' / ':'')+gb(d.total_mb)
-    +' · '+gb(d.usable_mb)+' usable';
-
+  /* ---- summary ---- */
   const bad=d.slots.filter(s=>s.contended).length;
   $('#sum').innerHTML=
     '<span>next <b>'+(d.next?esc(d.next.task)+'</b> in <b>'+dur(d.next.in_s):'—</b><b>')+'</b></span>'+
     '<span>baseline <b>'+gb(d.baseline.mb)+'</b></span>'+
-    '<span>window peak <b class="'+(d.peak_mb>d.usable_mb?'bad':d.peak_mb>d.usable_mb*.85?'warn':'')+'">'+gb(d.peak_mb)+'</b></span>'+
+    '<span>window peak <b class="'+(d.peak_mb>U?'bad':d.peak_mb>U*.85?'warn':'')+'">'+gb(d.peak_mb)+'</b></span>'+
     '<span>runs <b>'+d.blocks.filter(b=>!b.ambient).length+'</b></span>'+
-    '<span>tight slots <b class="'+(bad?'bad':'')+'">'+bad+'</b></span>';
+    '<span>over capacity <b class="'+(bad?'bad':'')+'">'+bad+'</b> slot'+(bad===1?'':'s')+'</span>';
 
+  const bi=(d.baseline.items||[]);
+  $('#base').innerHTML=bi.length
+    ? bi.map(i=>'<span>'+esc(i.name)+' <b>'+gb(i.mb)+'</b>'+
+        (i.hold_s?' <span class=hint>'+(i.kind==='other'?'assumed '+dur(i.hold_s)
+          :'keep-alive '+dur(i.hold_s))+'</span>':'')+'</span>').join('')
+    : '<span class=hint>nothing resident — the whole board is free</span>';
+
+  /* ---- banners ---- */
   let ban='';
   (d.collisions||[]).slice(0,3).forEach(c=>{
     const who=c.jobs[0]==='baseline alone'
       ? 'Nothing scheduled is to blame — the '+gb(c.base_mb)+' already resident is itself over the line'
       : esc(c.jobs.join(' + '))+(c.base_mb?', on top of '+gb(c.base_mb)+' already held':'');
     ban+='<div class="banner bad">'+hhmm(c.t)+'–'+hhmm(c.until)+' — '+gb(c.mb)+
-      ' projected vs '+gb(d.usable_mb)+' the gate can hand out. '+who+
+      ' projected vs '+gb(U)+' the gate can hand out. '+who+
       '. Expect a queue hold, then a forced admit at 120s.</div>';
   });
   (d.warnings||[]).forEach(w=>{ban+='<div class=banner>'+esc(w)+'</div>';});
   $('#banners').innerHTML=ban;
 
-  const bi=(d.baseline.items||[]);
-  $('#base').innerHTML=bi.length
-    ? bi.map(i=>'<span>'+esc(i.name)+' <b>'+gb(i.mb)+'</b>'+
-        (i.hold_s?' <span class=hint>'+(i.kind==='other'
-          ? 'assumed '+dur(i.hold_s)
-          : 'keep-alive '+dur(i.hold_s))+'</span>':'')+'</span>').join('')
-    : '<span class=hint>nothing resident — the whole board is free</span>';
+  /* ---- legend ---- */
+  $('#legend').innerHTML=d.series.length
+    ? d.series.map(s=>'<span class=lg><i style="background:'+colour(s)+'"></i>'+
+        esc(s.name)+' <b>'+gb(s.peak_mb)+'</b></span>').join('')
+      +'<span class=lg><i style="background:var(--crit);opacity:.5"></i>over capacity</span>'
+    : '<span class=hint>no VRAM committed anywhere in this window</span>';
 
-  /* ---- grid ---- */
-  let h='<div class=hdr><div>time</div><div>vram</div>'+
-        LANES.map(l=>'<div>'+l[1]+'</div>').join('')+'</div>';
-
-  let gut='';
-  const t0=new Date(d.origin);
-  for(let i=0;i<=d.hours;i++){
-    const t=new Date(t0.getTime()+i*3600000);
-    const mid=t.getHours()===0;
-    gut+='<div class="hr'+(mid?' day':'')+'" style="top:'+(i*pxh)+'px">'+
-      (mid?(t.getMonth()+1)+'/'+t.getDate():String(t.getHours()).padStart(2,'0')+':00')+'</div>';
+  /* ---- y axis: absolute VRAM, 0 to the board's real total ---- */
+  let y='';
+  for(let g=0;g<=Math.floor(T/1024);g+=4){
+    y+='<span style="top:'+(100-pct(g*1024))+'%">'+g+'GB</span>';
   }
-  h+='<div class="col gut" style="--h:'+H+'px">'+gut+'</div>';
+  $('#yax').innerHTML=y;
 
-  let sp='';
-  d.slots.forEach(s=>{
-    const r=s.mb/d.usable_mb;
-    const cls=s.contended?'bad':(r>=.85?'mid':'ok');
-    sp+='<div class="slot '+cls+'" title="'+hhmm(s.t)+'  '+gb(s.mb)+'" style="top:'+
-      (s.off_s/3600*pxh+1)+'px;height:'+(d.slot_s/3600*pxh-2)+'px"></div>';
-  });
-  h+='<div class="col spine" style="--h:'+H+'px">'+sp+'</div>';
+  /* ---- plot ---- */
+  let p='';
+  for(let g=0;g<=Math.floor(T/1024);g+=4){
+    p+='<div class=gl style="top:'+(100-pct(g*1024))+'%"></div>';
+  }
+  p+='<div class=over style="height:'+pct(T-U)+'%"></div>';
+  p+='<div class=thresh data-l="'+gb(U)+' usable" style="top:'+pct(T-U)+'%"></div>';
 
-  LANES.forEach(([id,,cls])=>{
-    const all=d.blocks.filter(b=>b.lane===id);
-
-    /* A 15-minute watchdog is 96 identical zero-cost blocks a day. Drawn one by
-       one it buries the handful of runs that actually matter, so anything that
-       repeats this often collapses into a single cadence band. */
-    const grp={};
-    all.forEach(b=>{(grp[b.task]=grp[b.task]||[]).push(b);});
-    const bands=[],loose=[];
-    Object.keys(grp).forEach(t=>{
-      const g=grp[t];
-      if(g[0].ambient||g.length>DENSE){bands.push(g);}else{g.forEach(b=>loose.push(b));}
+  const n=d.slots.length, cw=100/n;
+  d.slots.forEach((s,i)=>{
+    let acc=0, segs='';
+    /* Stack in server series order so bands line up across columns and read as
+       one continuous area rather than a shuffled bar chart. */
+    d.series.forEach(se=>{
+      const mb=s.parts[se.name]; if(!mb)return;
+      const h=pct(mb);
+      segs+='<div class=seg style="bottom:'+pct(acc)+'%;height:calc('+h+'% - 2px);'+
+            'background:'+colour(se)+'"></div>';
+      acc+=mb;
     });
-    pack(loose);
-    const lcols=loose.length?Math.max(...loose.map(b=>b._n)):0;
-    const cols=bands.length+lcols||1;
-    const cw=100/cols;
-    let body='';
-
-    bands.forEach((g,i)=>{
-      const b=g[0], amb=b.ambient;
-      let gap=null;
-      if(!amb&&g.length>1){
-        const ds=g.slice(1).map((x,j)=>x.off_s-g[j].off_s).sort((a,z)=>a-z);
-        gap=ds[Math.floor(ds.length/2)];
-      }
-      body+='<div class="blk '+cls+' band'+(b.running?' run':'')+(SEL===b.id?' sel':'')+
-        '" data-id="'+esc(b.id)+'" style="top:0;height:'+H+'px;left:calc('+(i*cw)+'% + 2px);width:calc('+cw+'% - 4px)">'+
-        '<span class=n>'+esc(b.task)+(b.peak_mb?'<span class=chip>'+gb(b.peak_mb)+'</span>':'')+'</span>'+
-        '<span class=m>'+(amb?'continuous':'every '+dur(gap)+' · '+g.length+'&times;')+'</span></div>';
-    });
-
-    loose.forEach(b=>{
-      const top=Math.max(0,b.off_s/3600*pxh);
-      const hgt=Math.max(17,b.dur_s/3600*pxh);
-      const left=(bands.length+b._c)*cw;
-      body+='<div class="blk '+cls+(b.running?' run':'')+(SEL===b.id?' sel':'')+
-        '" data-id="'+esc(b.id)+'" style="top:'+top+'px;height:'+hgt+'px;left:calc('+left+'% + 2px);width:calc('+cw+'% - 4px)">'+
-        '<span class=n>'+esc(b.task)+(b.peak_mb?'<span class=chip>'+gb(b.peak_mb)+'</span>':'')+'</span>'+
-        (hgt>28?'<span class=m>'+hhmm(b.start)+' · '+dur(b.dur_s)+'</span>':'')+
-        '</div>';
-    });
-    h+='<div class="col lanes" style="--h:'+H+'px">'+body+'</div>';
+    if(segs)p+='<div class=col data-i="'+i+'" style="left:'+(i*cw)+'%;width:'+cw+'%">'+segs+'</div>';
+    if(s.contended)p+='<div class=rug style="left:'+(i*cw)+'%;width:'+cw+'%"></div>';
   });
-  $('#grid').innerHTML=h;
+  p+='<div class=nowl style="left:'+(d.now_off_s/span*100)+'%"></div>';
+  $('#plot').innerHTML=p;
 
-  const nowTop=d.now_off_s/3600*pxh;
-  $('#grid').querySelectorAll('.col.lanes').forEach(c=>{
-    const n=document.createElement('div');n.className='now';n.style.top=nowTop+'px';c.appendChild(n);
-  });
+  /* ---- x axis: ticks on real hour boundaries, ~8 of them.
+         The origin is a slot boundary (e.g. 09:50), so stepping from it and
+         printing the hour would label that tick "09:00" - an hour adrift. ---- */
+  const t0=new Date(d.origin), stepH=Math.max(1,Math.round(d.hours/8));
+  const first=new Date(t0); first.setMinutes(0,0,0);
+  if(first<t0)first.setHours(first.getHours()+1);
+  while(first.getHours()%stepH!==0)first.setHours(first.getHours()+1);
+  let x='';
+  for(let t=new Date(first);(t-t0)/3600000<=d.hours;t.setHours(t.getHours()+stepH)){
+    const off=(t-t0)/1000, mid=t.getHours()===0;
+    x+='<span style="left:'+(off/span*100)+'%">'+
+       (mid?(t.getMonth()+1)+'/'+t.getDate():String(t.getHours()).padStart(2,'0')+':00')+'</span>';
+  }
+  $('#xax').innerHTML=x;
 
-  /* ---- phone list ---- */
-  const cnt={};
-  d.blocks.forEach(b=>{cnt[b.task]=(cnt[b.task]||0)+1;});
+  /* ---- zero-VRAM runs have no height on a VRAM axis, so they get a tick strip ---- */
+  const cnt={}; d.blocks.forEach(b=>{cnt[b.task]=(cnt[b.task]||0)+1;});
+  const cpuBlocks=d.blocks.filter(b=>!b.ambient&&!b.models.length);
+  const sparse=cpuBlocks.filter(b=>cnt[b.task]<=DENSE);
+  const denseNames=[...new Set(cpuBlocks.filter(b=>cnt[b.task]>DENSE).map(b=>b.task))];
+  let c=sparse.map(b=>'<i title="'+esc(b.task)+' '+hhmm(b.start)+'" style="left:'+
+        (b.off_s/span*100)+'%"></i>').join('');
+  c+='<em style="top:4px">no GPU: '+(sparse.length?sparse.length+' run'+(sparse.length===1?'':'s'):'')+
+     (denseNames.length?(sparse.length?' · ':'')+esc(denseNames.join(', '))+' (every 15m)':'')+'</em>';
+  $('#cpu').innerHTML=c;
+
+  /* ---- upcoming runs: the per-job detail, and the chart's table view ---- */
   const shown={};
   const up=d.blocks.filter(b=>!b.ambient&&b.off_s+b.dur_s>=d.now_off_s)
-                   .sort((a,b)=>a.off_s-b.off_s)
-                   /* same rule as the grid: a 15-min watchdog gets one row, not 96 */
-                   .filter(b=>cnt[b.task]<=DENSE||!shown[b.task]&&(shown[b.task]=1));
+    .sort((a,b)=>a.off_s-b.off_s)
+    .filter(b=>cnt[b.task]<=DENSE||(!shown[b.task]&&(shown[b.task]=1)));
   const tight=new Set(d.slots.filter(s=>s.contended).flatMap(s=>s.jobs));
-  $('#list').innerHTML=(up.length?up:[]).map(b=>
-    '<div class="li'+(tight.has(b.task)?' bad':'')+'" data-id="'+esc(b.id)+'">'+
-    '<div class=top><span class=tm>'+hhmm(b.start)+'</span>'+
-    '<span class=nm>'+esc(b.task)+(cnt[b.task]>DENSE?' <span class=hint>&times;'+cnt[b.task]+'</span>':'')+'</span>'+
-    '<span class=mb>'+dur(b.dur_s)+(b.peak_mb?' · '+gb(b.peak_mb):'')+'</span></div>'+
-    '<div class=d>'+esc(b.desc||'').slice(0,110)+'</div></div>').join('')
-    ||'<p class=hint style="padding:12px">Nothing scheduled in this window.</p>';
+  $('#table').innerHTML=up.length
+    ? '<table><thead><tr><th>time</th><th>job</th><th>holds</th>'+
+      '<th class=hide>for</th><th class="hide">what it does</th></tr></thead><tbody>'+
+      up.map(b=>{
+        const sw=b.models.map(m=>{const s=byName[m.name];
+          return s?'<i class=sw style="background:'+colour(s)+'"></i>':'';}).join('');
+        return '<tr class="j'+(SEL===b.id?' sel':'')+'" data-id="'+esc(b.id)+'">'+
+          '<td class=r>'+hhmm(b.start)+'</td>'+
+          '<td class="n'+(tight.has(b.task)?' tight':'')+'">'+sw+esc(b.task)+
+            (cnt[b.task]>DENSE?' <span class=hint>&times;'+cnt[b.task]+'</span>':'')+'</td>'+
+          '<td class=r>'+(b.peak_mb?gb(b.peak_mb):'—')+'</td>'+
+          '<td class="r hide">'+dur(b.dur_s)+'</td>'+
+          '<td class=hide>'+esc((b.desc||'').slice(0,80))+'</td></tr>';
+      }).join('')+'</tbody></table>'
+    : '<p class=hint>Nothing scheduled in this window.</p>';
 
-  document.querySelectorAll('.blk,.li').forEach(el=>
-    el.onclick=()=>{SEL=el.dataset.id;detail();render(DATA);});
+  document.querySelectorAll('tr.j').forEach(el=>
+    el.onclick=()=>{SEL=el.dataset.id;render(DATA);});
 
-  $('#foot').textContent='updated '+d.ts+' · '+d.hours+'h window · 30-min slots';
+  bindTip(d);
+  $('#foot').textContent='updated '+d.ts+' · '+d.hours+'h window · '+
+    d.slot_minutes+'-min slots';
   detail();
+}
+
+/* ---- hover layer: an area chart without one is a picture, not a chart ---- */
+function bindTip(d){
+  const plot=$('#plot'), tip=$('#tip');
+  plot.onmousemove=e=>{
+    const r=plot.getBoundingClientRect();
+    const i=Math.min(d.slots.length-1,Math.max(0,
+      Math.floor((e.clientX-r.left)/r.width*d.slots.length)));
+    const s=d.slots[i]; if(!s){tip.style.display='none';return;}
+    const rows=d.series.filter(se=>s.parts[se.name]).map(se=>
+      '<div class=r><i style="background:'+colour(se)+'"></i>'+esc(se.name)+
+      '<b>'+gb(s.parts[se.name])+'</b></div>').join('')
+      ||'<div class=r>nothing resident</div>';
+    const end=new Date(new Date(s.t).getTime()+d.slot_minutes*60000);
+    tip.innerHTML='<div class=h>'+hhmm(s.t)+'–'+
+      String(end.getHours()).padStart(2,'0')+':'+String(end.getMinutes()).padStart(2,'0')+
+      '</div>'+rows+
+      '<div class="r tot">total<b class="'+(s.contended?'tight':'')+'">'+gb(s.mb)+'</b></div>'+
+      (s.contended?'<div class=r style="color:var(--crit)">over the '+gb(d.usable_mb)+' limit</div>':'')+
+      (s.jobs.length?'<div class=r style="margin-top:4px">'+esc(s.jobs.join(', '))+'</div>':'');
+    tip.style.display='block';
+    const tw=tip.offsetWidth, th=tip.offsetHeight;
+    tip.style.left=Math.min(window.innerWidth-tw-8,Math.max(8,e.clientX+14))+'px';
+    tip.style.top=Math.max(8,e.clientY-th-12)+'px';
+  };
+  plot.onmouseleave=()=>{$('#tip').style.display='none';};
 }
 
 function detail(){
   const b=DATA&&DATA.blocks.find(x=>x.id===SEL);
-  if(!b){$('#det').innerHTML='<p class=hint>Pick a block to see what it does.</p>';return;}
-  const m=b.models.map(x=>esc(x.name)+' <span class=chip>'+gb(x.mb)+'</span>').join(' + ')
+  if(!b){$('#det').innerHTML='<p class=hint>Pick a run to see what it does.</p>';return;}
+  const m=b.models.map(x=>esc(x.name)+' <span class=hint>'+gb(x.mb)+'</span>').join(' + ')
         ||'<span class=hint>no model — CPU / network only</span>';
   const conf=b.dur_src==='measured'
       ? 'measured, n='+b.dur_n+(b.dur_lo!==b.dur_hi?' ('+dur(b.dur_lo)+'–'+dur(b.dur_hi)+')':'')
@@ -1047,7 +1129,7 @@ function detail(){
       '<span>holds <b>'+gb(b.peak_mb)+'</b></span>'+
       (b.limit_s?'<span>kill after '+dur(b.limit_s)+'</span>':'')+
       (b.last_run?'<span>last run '+esc(b.last_run)+
-        (b.last_result&&b.last_result!=='0'?' <b class=bad>rc='+esc(b.last_result)+'</b>':'')+'</span>':'')+
+        (b.last_result&&b.last_result!=='0'?' <b class=tight>rc='+esc(b.last_result)+'</b>':'')+'</span>':'')+
     '</div>'+
     (b.desc?'<p>'+esc(b.desc)+'</p>':'')+
     '<p>'+m+'</p>'+
