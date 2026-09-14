@@ -315,6 +315,20 @@ def _median(xs):
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
+def hist_key(name, prof=None):
+    """Which history bucket a task's runs belong in.
+
+    A regex-matched profile covers a family of tasks that are really the same job
+    under generated names - NFLModelCapture_20260914_1705 and tomorrow's
+    equivalent. Keyed by task name each would hold exactly one run and never reach
+    MIN_SAMPLES, so the family shares its profile's pattern as the key.
+    """
+    prof = prof if prof is not None else _profile(name)
+    if prof and prof.get("regex"):
+        return prof.get("match") or name
+    return name
+
+
 def _record_duration(name, seconds):
     """Observed wall clock for one run. Median, not high-water: unlike VRAM cost,
     over-estimating a duration is not the safe direction - it would paint
@@ -322,7 +336,7 @@ def _record_duration(name, seconds):
     global _hist_dirty
     if seconds is None or seconds < 0:
         return
-    h = _hist.setdefault(name, {"samples": []})
+    h = _hist.setdefault(hist_key(name), {"samples": []})
     h["samples"] = (h.get("samples") or [])[-(HIST_KEEP - 1):] + [int(seconds)]
     h["last_dur"] = int(seconds)
     h["last_run"] = datetime.now().isoformat(timespec="seconds")
@@ -331,7 +345,7 @@ def _record_duration(name, seconds):
 
 def _duration_for(name, prof):
     """(seconds, source, n, lo, hi) - learned median once there is enough of it."""
-    h = _hist.get(name) or {}
+    h = _hist.get(hist_key(name, prof)) or {}
     samples = h.get("samples") or []
     seed = int((prof or {}).get("seed_seconds", 60) or 0)
     seed_hi = (prof or {}).get("seed_max_seconds")

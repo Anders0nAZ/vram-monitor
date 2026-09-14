@@ -46,19 +46,35 @@ import schedule
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# (task, log path, description) - only sources that measure whole-run wall clock.
-SOURCES = [
-    ("RobonerRefresh", r"C:\FFL Robo Owner\refresh.log",
-     "=== refresh start === / === refresh done ==="),
-]
+ROBO = r"C:\FFL Robo Owner"
+NFL = r"C:\NFL Model"
+GM = r"C:\GroupMe Archive"
 
-REFUSED = [
-    ("GroupMeArchiveSync", r"C:\GroupMe Archive\sync.log",
-     "bracketed timestamps are one reused stamp - every run measures 0s"),
-    ("RobonerLineup / RobonerRoster", r"C:\FFL Robo Owner\inseason.log",
-     "cascade step-sums exclude wrapper + interpreter start; 30s vs 155s measured"),
-    ("NFLModelCaptureDaily", r"C:\NFL Model\capture.log",
-     "no timestamps in the log at all"),
+# (history key, log, how it is bracketed, parser, parser arg)
+#
+# Everything but refresh.log was unusable until the wrappers were given wall-clock
+# markers; those three now emit "=== run start: <task> ===" / "=== run end: <task>
+# exit=N ===" from the OUTERMOST wrapper, so the bracket includes the wrapper, cmd
+# and the interpreter start - the parts a step-sum leaves out. Only runs after that
+# change are readable, so these stay empty until each job next fires.
+SOURCES = [
+    ("RobonerRefresh", ROBO + r"\refresh.log",
+     "=== refresh start === / === refresh done ===", "refresh", None),
+    ("GroupMeArchiveSync", GM + r"\sync.log",
+     "--- sync start --- / --- sync end --- (02:00 runs only)", "sync", None),
+    ("RobonerLineup", ROBO + r"\inseason.log",
+     "=== run start: RobonerLineup ===", "marker", "RobonerLineup"),
+    ("RobonerRoster", ROBO + r"\inseason.log",
+     "=== run start: RobonerRoster ===", "marker", "RobonerRoster"),
+    ("RobonerPreKick", ROBO + r"\inseason.log",
+     "=== run start: RobonerPreKick ===", "marker", "RobonerPreKick"),
+    ("NFLModelCaptureDaily", NFL + r"\capture.log",
+     "=== run start: NFLModelCaptureDaily ===", "marker", "NFLModelCaptureDaily"),
+    # The pre-kickoff one-shots are generated with a different name every time, so
+    # their history lives under the profile's pattern rather than a task name -
+    # see schedule.hist_key.
+    (r"NFLModelCapture_\d{8}_\d{4}", NFL + r"\capture.log",
+     "=== run start: NFLModelCaptureNow ===", "marker", "NFLModelCaptureNow"),
 ]
 
 _TS = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]")
@@ -91,7 +107,62 @@ def parse_refresh(path):
     return runs
 
 
-PARSERS = {"RobonerRefresh": parse_refresh}
+def _lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().split("\n")
+    except OSError as exc:
+        print(f"  cannot read {path}: {exc}")
+        return []
+
+
+def _bracketed(path, is_start, is_end, keep=None):
+    """[(started, seconds)] from paired start/end lines carrying timestamps."""
+    runs, start = [], None
+    for line in _lines(path):
+        m = _TS.match(line)
+        if not m:
+            continue
+        try:
+            t = dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if is_start(line):
+            start = t                      # an unfinished run is simply replaced
+        elif is_end(line) and start:
+            secs = (t - start).total_seconds()
+            if 0 < secs <= 6 * 3600 and (keep is None or keep(start, secs)):
+                runs.append((start, secs))
+            start = None
+    return runs
+
+
+def parse_refresh(path, _arg=None):
+    return _bracketed(path,
+                      lambda l: "=== refresh start ===" in l,
+                      lambda l: "=== refresh done" in l)
+
+
+def parse_marker(path, task):
+    """The wrapper-emitted markers: === run start: <task> === / run end."""
+    s, e = f"=== run start: {task} ===", f"=== run end: {task} "
+    return _bracketed(path, lambda l: s in l, lambda l: e in l)
+
+
+def parse_sync(path, _arg=None):
+    """sync.log. Its markers always existed; until the frozen-timestamp fix they
+    measured 0s, so anything non-positive is a pre-fix run and drops out. Other
+    callers share this log, so only the scheduled 02:00 window counts."""
+    def scheduled(start, _secs):
+        return (start.hour == 2 and start.minute < 10) or \
+               (start.hour == 1 and start.minute >= 50)
+    return _bracketed(path,
+                      lambda l: "--- sync start ---" in l,
+                      lambda l: "--- sync end ---" in l,
+                      keep=scheduled)
+
+
+PARSERS = {"refresh": parse_refresh, "marker": parse_marker, "sync": parse_sync}
 
 
 def main():
@@ -105,11 +176,11 @@ def main():
     hist = schedule._hist
     changed = []
 
-    for task, path, how in SOURCES:
-        print(f"{task}\n  source: {path}\n  markers: {how}")
-        runs = PARSERS[task](path)
+    for task, path, how, parser, arg in SOURCES:
+        print(f"{task}\n  source: {os.path.basename(path)}  ({how})")
+        runs = PARSERS[parser](path, arg)
         if not runs:
-            print("  no complete runs found\n")
+            print("  no complete runs yet - waiting for the job to fire\n")
             continue
         runs.sort()
         cur = hist.get(task, {}) or {}
@@ -158,9 +229,8 @@ def main():
               f"range {after[3]}-{after[4]}s]\n")
         changed.append(task)
 
-    print("refused, and why:")
-    for task, path, why in REFUSED:
-        print(f"  {task:<28} {why}")
+    print("note: the wrappers were given wall-clock markers on 2026-09-14, so runs")
+    print("      before that are not readable and each job fills in when it next fires.")
     print()
 
     if not changed:

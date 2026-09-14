@@ -179,20 +179,34 @@ over the whole history reports 47s for a job that now takes half an hour.
 that runs weekly does not take a month to characterise. It is dry-run by default.
 
 It only reads logs that record **the same quantity the poller measures** - wall
-clock for one whole run - and says so about the ones it refuses:
+clock for one whole run. Originally only one of the four qualified:
 
-| Log | |
-|---|---|
-| `refresh.log` | **used.** Start/done markers with real timestamps. Cross-checked against the poller: 5005s from the log vs 4994s measured independently on the same run |
-| `sync.log` | refused. Its bracketed timestamps are one stamp reused for the whole run - start and end both read 02:00:01 while the body reports 123.9s of work |
-| `inseason.log` | refused. Cascade step-sums are the cascade's internal work, excluding the wrapper and interpreter start: 30s against 155s measured |
-| `capture.log` | refused. No timestamps at all |
+| Log | Then | Now |
+|---|---|---|
+| `refresh.log` | **used.** Start/done markers with real timestamps. Cross-checked against the poller: 5005s from the log vs 4994s measured independently on the same run | unchanged |
+| `sync.log` | its bracketed timestamps were one stamp reused for the whole run - start and end both read 02:00:01 while the body reported 123.9s of work | **fixed at the source**: `SyncScheduled.ps1` stamped at script start instead of at call time |
+| `inseason.log` | cascade step-sums are the cascade's internal work, excluding the wrapper and interpreter start: 30s against 155s measured | **markers added** to the three wrappers |
+| `capture.log` | no timestamps at all | **markers added** to both batch files |
 
 A wrong duration is worse than no duration, since it is what decides whether the
-calendar claims a slot fits, so the refusals stay refusals rather than being
-patched up with an assumed startup offset. The newest run is normally in both the
-log and the poller's samples; that overlap is de-duplicated by matching the
-poller's `last_run` against each backfilled run's end time.
+calendar claims a slot fits - so rather than patch the gaps with an assumed
+startup offset, the wrappers now emit the real thing:
+
+```
+[2026-09-14 16:00:02] === run start: RobonerLineup ===
+[2026-09-14 16:02:35] === run end: RobonerLineup exit=0 ===
+```
+
+Emitted by the **outermost** wrapper, so the bracket includes the wrapper, `cmd`,
+the interpreter start and the imports - the parts a step-sum leaves out. The
+marker names the task because several wrappers append to one log (three write
+cascade blocks into `inseason.log`, and those blocks are otherwise anonymous),
+which also makes a run attributable to the task that launched it. Only runs after
+2026-09-14 carry markers, so each job fills in when it next fires.
+
+The newest run is normally in both the log and the poller's samples; that overlap
+is de-duplicated by matching the poller's `last_run` against each backfilled run's
+end time.
 
 To add a job, drop a block into `jobs.json` — `match` (or a `regex`), `lane`,
 `models`, `seed_seconds`. A task with no entry stays off the calendar entirely.
