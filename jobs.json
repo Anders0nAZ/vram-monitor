@@ -1,0 +1,188 @@
+{
+  "_comment": [
+    "GPU profile for scheduled jobs, read by schedule.py to build the /schedule look-ahead.",
+    "",
+    "Windows Task Scheduler is the source of truth for WHEN a job runs and WHAT it is",
+    "(its own <Description> is used verbatim unless 'desc' overrides it). This file only",
+    "adds what Task Scheduler cannot know: which models the job loads, and how long it takes.",
+    "",
+    "job fields:",
+    "  match         task name (URI minus the leading backslash), or a regex if regex:true",
+    "  regex         treat 'match' as a Python regex anchored with fullmatch",
+    "  lane          gpu-heavy | gpu-light | cpu | always-on   (column on the calendar)",
+    "  models        model names as Ollama reports them; costs come from model-costs.json.",
+    "                Concurrent jobs sharing a model are charged for it ONCE - one copy in VRAM.",
+    "  seed_seconds  duration estimate used until >=3 runs have been observed",
+    "  seed_max_seconds  optional upper end when a job's cost is genuinely bimodal",
+    "  desc          optional override of the task's own Description",
+    "  note          optional extra line shown when a block is expanded",
+    "",
+    "daemons are not scheduled - they explain the always-resident VRAM baseline."
+  ],
+
+  "lanes": [
+    { "id": "gpu-heavy", "label": "GPU heavy" },
+    { "id": "gpu-light", "label": "GPU light" },
+    { "id": "cpu",       "label": "CPU / network" },
+    { "id": "always-on", "label": "Always on" }
+  ],
+
+  "jobs": [
+    {
+      "match": "RobonerRefresh",
+      "lane": "gpu-heavy",
+      "models": ["qwen3.8:27b-mtp-96k", "nomic-embed-text:latest"],
+      "seed_seconds": 1860,
+      "seed_max_seconds": 2100,
+      "note": "scout judges the entire ~308-player pool, not just changed players - it is the whole runtime. Observed scout step: 903s / 2033s / 1710s. Holds the 16.9GB model well past 07:00, which is what collides with RobonerRoster."
+    },
+    {
+      "match": "RobonerLineup",
+      "lane": "gpu-light",
+      "models": ["qwen3.8:27b-mtp-96k"],
+      "seed_seconds": 25,
+      "seed_max_seconds": 75,
+      "note": "robo.cascade --apply. Bimodal: scout's verdict cache is usually warm (0 LLM calls, ~20s), but a cold cache pushes it past a minute and loads the 16.9GB model."
+    },
+    {
+      "match": "RobonerRoster",
+      "lane": "gpu-light",
+      "models": ["qwen3.8:27b-mtp-96k"],
+      "seed_seconds": 25,
+      "seed_max_seconds": 75,
+      "note": "Same cascade as RobonerLineup. At 07:00 it usually finds the model already resident from RobonerRefresh - free when that overlap holds, a 16.9GB load when it does not."
+    },
+    {
+      "match": "RobonerMoves",
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 20,
+      "note": "robo.ir + robo.moves only - no scout step, so no LLM call. Sleeper API and the local optimizer."
+    },
+    {
+      "match": "RobonerWaivers",
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 30,
+      "note": "The one live-write job: submits real FAAB claims to Sleeper and reads them back. No LLM call."
+    },
+    {
+      "match": "RobonerWatchdog",
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 5,
+      "note": "Reads /api/ps to assert GPU placement - a free metadata call, never loads a model."
+    },
+    {
+      "match": "RerankerWatchdog",
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 4,
+      "note": "Pings the CPU reranker on :8090. No GPU involvement at all."
+    },
+    {
+      "match": "GroupMeArchiveSync",
+      "lane": "gpu-light",
+      "models": ["qwen3-vl:8b-instruct", "nomic-embed-text:latest"],
+      "seed_seconds": 130,
+      "seed_max_seconds": 300,
+      "note": "Captions new images (qwen3-vl, 2 workers, <=200/run) then embeds text + captions. Skips the model work entirely if Ollama does not answer /api/version. Cost scales with how many images arrived that day."
+    },
+    {
+      "match": "NFLModelCaptureDaily",
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 45,
+      "note": "Pure CPU + network (Sleeper, nflverse, odds). Also self-registers today's one-shot pre-kickoff captures, so new NFLModelCapture_* tasks appear on this calendar during the day."
+    },
+    {
+      "match": "NFLModelCapture_\\d{8}_\\d{4}",
+      "regex": true,
+      "lane": "cpu",
+      "models": [],
+      "seed_seconds": 30,
+      "desc": "One-shot pre-kickoff capture queued by NFLModelCaptureDaily, ~15 min before a game slot.",
+      "note": "A missed window is unrecoverable - this is the one job whose value depends on hitting its time exactly."
+    },
+    {
+      "match": "ComfyModelSorter",
+      "lane": "always-on",
+      "models": [],
+      "seed_seconds": 0,
+      "note": "Continuous 5s filesystem watcher since logon, not a discrete run. Stdlib only, CPU and disk - it reads safetensors/GGUF headers, it does not load models onto the GPU."
+    },
+    {
+      "match": "RobonerAutostart",
+      "lane": "always-on",
+      "models": [],
+      "seed_seconds": 0,
+      "note": "Logon trigger. Brings up ollama serve, then launches robo.chat_responder - see the daemon below for the VRAM that leaves behind."
+    }
+  ],
+
+  "_processes_comment": [
+    "How a process holding VRAM gets named on the dashboard and the chart.",
+    "First rule whose 'match' appears in the process name or full image path wins;",
+    "anything unmatched falls through to 'other apps'. Matching is lowercase substring.",
+    "",
+    "  group  ollama | comfyui | container | desktop | tools | app",
+    "  label  what the user sees",
+    "",
+    "The ollama group is special-cased: llama-server's VRAM is split into the model",
+    "weights Ollama reports via /api/ps and the remainder, which is the engine's own",
+    "overhead (vision projector, MTP draft cache, CUDA context, compute buffers)."
+  ],
+  "processes": [
+    { "match": "llama-server",   "group": "ollama",    "label": "Ollama engine" },
+    { "match": "\\ollama",       "group": "ollama",    "label": "Ollama server" },
+    { "match": "comfyui",        "group": "comfyui",   "label": "ComfyUI" },
+    { "match": "vmwp.exe",       "group": "container", "label": "WSL2 / Docker VM" },
+    { "match": "vmmem",          "group": "container", "label": "WSL2 / Docker VM" },
+    { "match": "docker desktop", "group": "container", "label": "Docker Desktop" },
+    { "match": "dwm.exe",        "group": "desktop",   "label": "Windows compositor" },
+    { "match": "csrss.exe",      "group": "desktop",   "label": "Windows compositor" },
+    { "match": "explorer.exe",   "group": "desktop",   "label": "Windows shell" },
+    { "match": "searchhost",     "group": "desktop",   "label": "Windows shell" },
+    { "match": "startmenu",      "group": "desktop",   "label": "Windows shell" },
+    { "match": "shellexperience","group": "desktop",   "label": "Windows shell" },
+    { "match": "applicationframe","group": "desktop",  "label": "Windows shell" },
+    { "match": "textinputhost",  "group": "desktop",   "label": "Windows shell" },
+    { "match": "phoneexperience","group": "desktop",   "label": "Windows shell" },
+    { "match": "system",         "group": "desktop",   "label": "Windows kernel" },
+    { "match": "claude.exe",     "group": "tools",     "label": "Claude Code" },
+    { "match": "chatgpt.exe",    "group": "tools",     "label": "Codex" },
+    { "match": "codex-",         "group": "tools",     "label": "Codex" },
+    { "match": "windowsterminal","group": "tools",     "label": "Terminal" },
+    { "match": "chrome.exe",     "group": "app",       "label": "Chrome" },
+    { "match": "msedgewebview2", "group": "app",       "label": "WebView2" },
+    { "match": "steamwebhelper", "group": "app",       "label": "Steam" },
+    { "match": "discord",        "group": "app",       "label": "Discord" }
+  ],
+
+  "daemons": [
+    {
+      "id": "chat-responder",
+      "label": "robo.chat_responder",
+      "models": ["qwen3.8:27b-mtp-96k"],
+      "note": "45s GroupMe poll loop started by RobonerAutostart. Calls the model on activity with keep_alive 30m, so during active hours it holds 16.9GB more or less permanently. This is the baseline everything else has to fit around."
+    },
+    {
+      "id": "historian",
+      "label": "GroupMe historian",
+      "models": ["qwen3.6:27b-mtp-q4_K_M"],
+      "note": "FastAPI bot on :8000 started from the Startup folder. Loads on demand per question, not resident."
+    },
+    {
+      "id": "comfy-sorter",
+      "label": "ComfyModelSorter",
+      "models": [],
+      "note": "CPU/disk only - listed so the always-on lane is complete."
+    },
+    {
+      "id": "adhoc",
+      "label": "Open WebUI / OpenHands / Qwen Code",
+      "models": [],
+      "note": "Unscheduled and unpredictable. vram-monitor.log shows qwen3:1.7b and qwen3:30b-a3b loading at times matching no scheduled task - most likely one of these. The forecast cannot see them coming."
+    }
+  ]
+}
