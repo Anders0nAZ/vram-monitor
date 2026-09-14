@@ -46,6 +46,12 @@ SLOT_FOR_HOURS = {6: 10, 12: 15, 24: 30}
 MAX_OCC        = 400      # per-trigger runaway guard
 HIST_KEEP      = 20       # observed durations retained per task
 MIN_SAMPLES    = 3        # before a learned median beats the seed
+# Estimate from the most recent runs only. These durations drift with regime, not
+# just noise: RobonerRefresh ran 12-48s through August and 207-5005s from the
+# first week of the season, because scout went from a quiet news pool to a full
+# one. A flat median over 20 samples would have reported 47s for a job that now
+# takes half an hour - and it is the job that causes the contention.
+MEDIAN_WINDOW  = 8
 DEFAULT_COST_MB = 4096    # unknown model
 FALLBACK_TOTAL_MB = 24576 # if the board is not readable (RTX 3090)
 RESERVE_MB     = 1024     # mirrors vram_monitor.RESERVE_MB
@@ -330,8 +336,9 @@ def _duration_for(name, prof):
     seed = int((prof or {}).get("seed_seconds", 60) or 0)
     seed_hi = (prof or {}).get("seed_max_seconds")
     if len(samples) >= MIN_SAMPLES:
-        return (int(_median(samples)), "measured", len(samples),
-                min(samples), max(samples))
+        recent = samples[-MEDIAN_WINDOW:]
+        return (int(_median(recent)), "measured", len(samples),
+                min(recent), max(recent))
     hi = int(seed_hi) if seed_hi else seed
     return seed, "estimated", len(samples), seed, hi
 

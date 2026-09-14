@@ -167,6 +167,33 @@ collisions across the calendar.
 Jobs repeating more than a handful of times in the window (a 15-minute watchdog is
 96 runs a day) collapse into one "every 15m" cadence band instead of 96 blocks.
 
+The estimate uses the most recent `MEDIAN_WINDOW` runs, not all of them, because
+these durations drift with regime rather than just wobbling around a mean.
+`RobonerRefresh` ran 12-48s through August and 207-5005s from the first week of
+the season, when scout went from a quiet news pool to a full one; a flat median
+over the whole history reports 47s for a job that now takes half an hour.
+
+### Backfilling history from the projects' logs
+
+`backfill_history.py` seeds `job-history.json` from a project's own log, so a job
+that runs weekly does not take a month to characterise. It is dry-run by default.
+
+It only reads logs that record **the same quantity the poller measures** - wall
+clock for one whole run - and says so about the ones it refuses:
+
+| Log | |
+|---|---|
+| `refresh.log` | **used.** Start/done markers with real timestamps. Cross-checked against the poller: 5005s from the log vs 4994s measured independently on the same run |
+| `sync.log` | refused. Its bracketed timestamps are one stamp reused for the whole run - start and end both read 02:00:01 while the body reports 123.9s of work |
+| `inseason.log` | refused. Cascade step-sums are the cascade's internal work, excluding the wrapper and interpreter start: 30s against 155s measured |
+| `capture.log` | refused. No timestamps at all |
+
+A wrong duration is worse than no duration, since it is what decides whether the
+calendar claims a slot fits, so the refusals stay refusals rather than being
+patched up with an assumed startup offset. The newest run is normally in both the
+log and the poller's samples; that overlap is de-duplicated by matching the
+poller's `last_run` against each backfilled run's end time.
+
 To add a job, drop a block into `jobs.json` — `match` (or a `regex`), `lane`,
 `models`, `seed_seconds`. A task with no entry stays off the calendar entirely.
 Anything self-registering can be matched by pattern: `NFLModelCapture_\d{8}_\d{4}`
