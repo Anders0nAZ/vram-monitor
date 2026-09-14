@@ -185,6 +185,30 @@ def _manifest():
     return _load_json(JOBS_FILE, "jobs", {"jobs": [], "daemons": [], "lanes": []})
 
 
+def process_rules():
+    """Name-a-process rules, read by vram_monitor's VRAM attribution."""
+    return _manifest().get("processes", [])
+
+
+def loaders_of(model):
+    """Which jobs and daemons declare this model - i.e. who would have loaded it.
+
+    jobs.json already says which models each job pulls in, so the reverse index
+    answers "what put this on the GPU" without any extra bookkeeping.
+    """
+    key = _norm_model(model)
+    out = []
+    m = _manifest()
+    for entry in m.get("jobs", []):
+        if key in [_norm_model(x) for x in (entry.get("models") or [])]:
+            out.append({"name": entry.get("match"), "kind": "job"})
+    for entry in m.get("daemons", []):
+        if key in [_norm_model(x) for x in (entry.get("models") or [])]:
+            out.append({"name": entry.get("label") or entry.get("id"),
+                        "kind": "daemon"})
+    return out
+
+
 def _costs():
     raw = _load_json(COST_FILE, "costs", {})
     out = {}
@@ -520,10 +544,11 @@ def _board():
         try:
             b = fn() or {}
             if b.get("total_mb"):
-                return int(b["total_mb"]), b.get("used_mb"), b.get("other_mb")
+                return (int(b["total_mb"]), b.get("used_mb"), b.get("other_mb"),
+                        b.get("attrib"))
         except Exception:
             pass
-    return FALLBACK_TOTAL_MB, None, None
+    return FALLBACK_TOTAL_MB, None, None, None
 
 
 def _baseline():
@@ -557,14 +582,29 @@ def _baseline():
             continue
         hold = float(ka) if ka is not None else KEEPALIVE_FALLBACK
         items.append({"name": _norm_model(name), "mb": int(mb),
-                      "hold_s": max(0.0, hold), "kind": "model"})
+                      "hold_s": max(0.0, hold), "kind": "model",
+                      "by": loaders_of(name)})
 
-    _, _, other = _board()
-    if other and other >= BASELINE_FLOOR_MB:
-        items.append({"name": "other (ComfyUI / unattributed)", "mb": int(other),
+    # Non-Ollama VRAM, named. attribute_vram() reads the OS per-process counters,
+    # so this is measured rather than the old "other (ComfyUI / unattributed)"
+    # residual - which on this box was mostly Ollama's own engine overhead while
+    # ComfyUI sat at zero.
+    _, _, other, attrib = _board()
+    if attrib and attrib.get("ok"):
+        for part in attrib.get("parts", []):
+            mb = int(part.get("mb") or 0)
+            if mb < BASELINE_FLOOR_MB:
+                continue
+            items.append({"name": part["label"], "mb": mb,
+                          "hold_s": float(OTHER_HOLD_SECONDS),
+                          "kind": part.get("group", "other"),
+                          "procs": part.get("procs", [])})
+    elif other and other >= BASELINE_FLOOR_MB:
+        items.append({"name": "unattributed", "mb": int(other),
                       "hold_s": float(OTHER_HOLD_SECONDS), "kind": "other"})
     return {"mb": sum(i["mb"] for i in items), "items": items,
-            "other_hold_s": OTHER_HOLD_SECONDS}
+            "other_hold_s": OTHER_HOLD_SECONDS,
+            "measured": bool(attrib and attrib.get("ok"))}
 
 
 def forecast(hours=6, now=None):
@@ -586,7 +626,7 @@ def forecast(hours=6, now=None):
                 "origin": origin.isoformat(timespec="seconds"), "blocks": [],
                 "slots": [], "warnings": warns}
 
-    total_mb, used_mb, other_mb = _board()
+    total_mb, used_mb, other_mb, _ = _board()
     usable_mb = max(1, total_mb - RESERVE_MB)
     base = _baseline()
     now_off = (now - origin).total_seconds()
@@ -703,13 +743,19 @@ def forecast(hours=6, now=None):
     other = sorted(n for n in names if not _is_model(n))
     models = sorted(n for n in names if _is_model(n))
     universe = _palette_order()
-    series = [{"name": n, "slot": -1, "kind": "other"} for n in other]
+    # Overhead holders (Ollama's engine, the compositor, the driver reserve) are
+    # not identities competing with the models, so they take a neutral ramp rather
+    # than categorical hues - but they still need to be told apart, which one flat
+    # grey for all of them did not do.
+    series = [{"name": n, "slot": i % 3, "kind": "other"}
+              for i, n in enumerate(other)]
     series += [{"name": n,
                 "slot": (universe.index(n) if n in universe
                          else len(universe) + sorted(names).index(n)) % 6,
-                "kind": "model"} for n in models]
+                "kind": "model", "by": loaders_of(n)} for n in models]
     for s in series:
         s["peak_mb"] = max((sl["parts"].get(s["name"], 0) for sl in slots), default=0)
+        s.setdefault("by", [])
 
     upcoming = sorted((b for b in blocks if not b["ambient"] and b["off_s"] >= 0),
                       key=lambda b: b["off_s"])
@@ -802,9 +848,11 @@ SCHED_PAGE = r"""<!doctype html><html><head><meta charset=utf-8>
    card surface (#161b22) - worst adjacent CVD dE 8.4, all six >=3:1 contrast.
    Assigned by model NAME so a model keeps its hue as the set changes. */
 --s0:#3987e5;--s1:#d95926;--s2:#199e70;--s3:#c98500;--s4:#d55181;--s5:#9085e9;
---other:#6e7681;                       /* unattributed residual, not an identity */
+/* Neutral ramp for overhead holders - not identities, so no hue. Only these
+   three steps clear 3:1 on this surface (8.2 / 5.6 / 3.8); darker greys fail. */
+--n0:#aab4bf;--n1:#8b949e;--n2:#6e7681;
 --crit:#d03b3b;--warnc:#fab219;        /* status - never reused for a series */
---grid:#21262d;--plot-h:300px}
+--grid:#21262d;--plot-h:280px;--gut:86px;--row-h:19px}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
 font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:14px}
 .wrap{max-width:1180px;margin:0 auto}
@@ -834,7 +882,7 @@ padding:9px 11px;margin-bottom:12px;font-size:12.5px}
 .lg b{color:var(--fg);font-weight:600}
 
 /* ---- chart ---- */
-.chart{display:grid;grid-template-columns:54px minmax(0,1fr);gap:0}
+.chart{display:grid;grid-template-columns:var(--gut) minmax(0,1fr);gap:0}
 .yax{position:relative;height:var(--plot-h)}
 .yax span{position:absolute;right:8px;transform:translateY(-50%);color:var(--mut);font-size:11px;white-space:nowrap}
 .plot{position:relative;height:var(--plot-h);border-left:1px solid var(--bd);
@@ -850,11 +898,27 @@ color:var(--crit);background:var(--card);padding:0 4px}
 .nowl{position:absolute;top:0;bottom:0;width:0;border-left:1px solid var(--red);z-index:4}
 .nowl:after{content:'now';position:absolute;left:3px;top:1px;font-size:10px;color:var(--red);
 background:var(--card);padding:0 3px}
-.xax{position:relative;height:20px;margin-left:54px;margin-top:4px}
+.xax{position:relative;height:20px;margin-left:var(--gut);margin-top:4px}
 .xax span{position:absolute;transform:translateX(-50%);color:var(--mut);font-size:11px;white-space:nowrap}
-.cpu{position:relative;height:22px;margin-left:54px;border-top:1px solid var(--grid);margin-top:2px}
-.cpu i{position:absolute;top:6px;width:2px;height:8px;background:var(--mut);display:block}
-.cpu em{position:absolute;top:4px;left:0;font-style:normal;color:var(--mut);font-size:10.5px}
+
+/* ---- job strip: the old lanes, kept as rows on the same time axis ---- */
+.strip{display:grid;grid-template-columns:var(--gut) minmax(0,1fr);
+border-top:1px solid var(--grid);margin-top:10px;padding-top:8px}
+.rowlbl{position:relative}
+.rowlbl span{position:absolute;right:8px;
+color:var(--mut);font-size:10.5px;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em}
+.rows{position:relative}
+.row{position:relative;height:var(--row-h);border-bottom:1px solid #1b222c}
+.row:last-child{border-bottom:0}
+.jb{position:absolute;top:2px;height:calc(var(--row-h) - 5px);border-radius:3px;
+min-width:3px;cursor:pointer;overflow:hidden;font-size:10px;line-height:14px;
+padding:0 4px;white-space:nowrap;color:#0d1117;font-weight:600}
+.jb:hover{filter:brightness(1.2)}
+.jb.sel{outline:2px solid var(--fg);outline-offset:-1px;z-index:3}
+.jb.cpu{background:#3d444d;color:var(--fg);font-weight:400}
+.jb.amb{background:repeating-linear-gradient(45deg,#2a313c 0 6px,#232a34 6px 12px);
+color:var(--mut);font-weight:400}
+.nowr{position:absolute;top:0;bottom:0;width:0;border-left:1px solid var(--red);z-index:4}
 
 /* ---- tooltip ---- */
 .tip{position:fixed;z-index:50;background:#0d1117;border:1px solid var(--bd);border-radius:7px;
@@ -918,7 +982,10 @@ td.r{text-align:right;color:var(--mut);white-space:nowrap}
     <div class=plot id=plot></div>
   </div>
   <div class=xax id=xax></div>
-  <div class=cpu id=cpu></div>
+  <div class=strip>
+    <div class=rowlbl id=rowlbl></div>
+    <div class=rows id=rows></div>
+  </div>
 </div>
 
 <div class=card>
@@ -946,7 +1013,7 @@ function setWin(h){WIN=h;localStorage.setItem('sched_win',h);tick();}
 
 /* Colour follows the entity: the server assigns a slot per model name, so a
    model keeps its hue when other series appear or vanish. */
-function colour(s){return s.kind==='other'?'var(--other)':'var(--s'+s.slot+')';}
+function colour(s){return s.kind==='other'?'var(--n'+s.slot+')':'var(--s'+s.slot+')';}
 
 function render(d){
   const T=d.total_mb||24576, U=d.usable_mb, span=d.hours*3600;
@@ -968,11 +1035,21 @@ function render(d){
     '<span>over capacity <b class="'+(bad?'bad':'')+'">'+bad+'</b> slot'+(bad===1?'':'s')+'</span>';
 
   const bi=(d.baseline.items||[]);
-  $('#base').innerHTML=bi.length
-    ? bi.map(i=>'<span>'+esc(i.name)+' <b>'+gb(i.mb)+'</b>'+
-        (i.hold_s?' <span class=hint>'+(i.kind==='other'?'assumed '+dur(i.hold_s)
-          :'keep-alive '+dur(i.hold_s))+'</span>':'')+'</span>').join('')
-    : '<span class=hint>nothing resident — the whole board is free</span>';
+  $('#base').innerHTML=(bi.length
+    ? bi.map(i=>{
+        const who=i.kind==='model'
+          ? (i.by&&i.by.length?i.by.map(x=>x.name).join(', '):'no declared loader')
+          : (i.procs&&i.procs.length
+              ? [...new Set(i.procs.map(p=>p.name))].slice(0,2).join(', ')
+              : '');
+        return '<span>'+esc(i.name)+' <b>'+gb(i.mb)+'</b>'+
+          (who?' <span class=hint>'+esc(who)+'</span>':'')+
+          (i.kind==='model'&&i.hold_s?' <span class=hint>keep-alive '+dur(i.hold_s)+'</span>':'')+
+          '</span>';
+      }).join('')
+    : '<span class=hint>nothing resident — the whole board is free</span>')
+    +(d.baseline.measured===false
+      ? '<span class=hint>(per-process counters unavailable — residual only)</span>':'');
 
   /* ---- banners ---- */
   let ban='';
@@ -989,8 +1066,13 @@ function render(d){
 
   /* ---- legend ---- */
   $('#legend').innerHTML=d.series.length
-    ? d.series.map(s=>'<span class=lg><i style="background:'+colour(s)+'"></i>'+
-        esc(s.name)+' <b>'+gb(s.peak_mb)+'</b></span>').join('')
+    ? d.series.map(s=>{
+        const by=(s.by||[]).map(x=>x.name);
+        const who=by.length===0?'':(by.length<=2?by.join(', '):by.length+' jobs');
+        return '<span class=lg><i style="background:'+colour(s)+'"></i>'+
+          esc(s.name)+' <b>'+gb(s.peak_mb)+'</b>'+
+          (who?' <span class=hint>&larr; '+esc(who)+'</span>':'')+'</span>';
+      }).join('')
       +'<span class=lg><i style="background:var(--crit);opacity:.5"></i>over capacity</span>'
     : '<span class=hint>no VRAM committed anywhere in this window</span>';
 
@@ -1042,16 +1124,51 @@ function render(d){
   }
   $('#xax').innerHTML=x;
 
-  /* ---- zero-VRAM runs have no height on a VRAM axis, so they get a tick strip ---- */
+  /* ---- job strip: a run has no height on a VRAM axis (a CPU job has none at
+         all), so the lanes live on as rows sharing this chart's time axis ---- */
   const cnt={}; d.blocks.forEach(b=>{cnt[b.task]=(cnt[b.task]||0)+1;});
-  const cpuBlocks=d.blocks.filter(b=>!b.ambient&&!b.models.length);
-  const sparse=cpuBlocks.filter(b=>cnt[b.task]<=DENSE);
-  const denseNames=[...new Set(cpuBlocks.filter(b=>cnt[b.task]>DENSE).map(b=>b.task))];
-  let c=sparse.map(b=>'<i title="'+esc(b.task)+' '+hhmm(b.start)+'" style="left:'+
-        (b.off_s/span*100)+'%"></i>').join('');
-  c+='<em style="top:4px">no GPU: '+(sparse.length?sparse.length+' run'+(sparse.length===1?'':'s'):'')+
-     (denseNames.length?(sparse.length?' · ':'')+esc(denseNames.join(', '))+' (every 15m)':'')+'</em>';
-  $('#cpu').innerHTML=c;
+  const LANES=(d.lanes&&d.lanes.length?d.lanes:[
+    {id:'gpu-heavy',label:'GPU heavy'},{id:'gpu-light',label:'GPU light'},
+    {id:'cpu',label:'CPU / net'},{id:'always-on',label:'always on'}]);
+  let lb='',rw='',top=0;
+  LANES.forEach(ln=>{
+    const mine=d.blocks.filter(b=>b.lane===ln.id);
+    /* A 15-minute watchdog is 97 slivers in a 19px row, so it collapses to one
+       labelled band. Those bands and the continuous jobs are all full-width, so
+       two in a lane would sit exactly on top of each other - they get a sub-lane
+       each and the row grows to fit. */
+    const full=[],timed=[],seen={};
+    mine.forEach(b=>{
+      const dense=cnt[b.task]>DENSE&&!b.ambient;
+      if((dense||b.ambient)&&seen[b.task])return;
+      if(dense||b.ambient){seen[b.task]=1;full.push([b,dense]);}else timed.push(b);
+    });
+    const sub=Math.max(1,full.length);
+    const rh=Math.max(19,sub*13+4);
+    lb+='<span style="top:'+top+'px;height:'+rh+'px;line-height:'+rh+'px">'+esc(ln.label)+'</span>';
+    top+=rh;
+    let bars='';
+    full.forEach(([b,dense],i)=>{
+      const h=(rh-4)/sub;
+      bars+='<div class="jb '+(b.ambient?'amb':'cpu')+(SEL===b.id?' sel':'')+
+        '" data-id="'+esc(b.id)+'" style="left:0;width:100%;top:'+(2+i*h)+
+        'px;height:'+(h-1)+'px;line-height:'+(h-1)+'px" title="'+esc(b.task)+
+        (b.ambient?' (continuous)':' ×'+cnt[b.task])+'">'+
+        esc(b.task)+(dense?' ×'+cnt[b.task]:'')+'</div>';
+    });
+    timed.forEach(b=>{
+      const se=b.models.length?byName[b.models[0].name]:null;
+      const w=Math.max(0.35,b.dur_s/span*100);
+      bars+='<div class="jb '+(b.models.length?'':'cpu')+(SEL===b.id?' sel':'')+
+        '" data-id="'+esc(b.id)+'" style="left:'+(b.off_s/span*100)+'%;width:'+w+'%;'+
+        (se?'background:'+colour(se):'')+'" title="'+esc(b.task)+' '+hhmm(b.start)+
+        ' · '+dur(b.dur_s)+(b.peak_mb?' · '+gb(b.peak_mb):'')+'">'+
+        (w>6?esc(b.task):'')+'</div>';
+    });
+    rw+='<div class=row style="height:'+rh+'px">'+bars+'</div>';
+  });
+  $('#rowlbl').innerHTML=lb;
+  $('#rows').innerHTML=rw+'<div class=nowr style="left:'+(d.now_off_s/span*100)+'%"></div>';
 
   /* ---- upcoming runs: the per-job detail, and the chart's table view ---- */
   const shown={};
@@ -1075,7 +1192,7 @@ function render(d){
       }).join('')+'</tbody></table>'
     : '<p class=hint>Nothing scheduled in this window.</p>';
 
-  document.querySelectorAll('tr.j').forEach(el=>
+  document.querySelectorAll('tr.j,.jb').forEach(el=>
     el.onclick=()=>{SEL=el.dataset.id;render(DATA);});
 
   bindTip(d);
@@ -1092,10 +1209,12 @@ function bindTip(d){
     const i=Math.min(d.slots.length-1,Math.max(0,
       Math.floor((e.clientX-r.left)/r.width*d.slots.length)));
     const s=d.slots[i]; if(!s){tip.style.display='none';return;}
-    const rows=d.series.filter(se=>s.parts[se.name]).map(se=>
-      '<div class=r><i style="background:'+colour(se)+'"></i>'+esc(se.name)+
-      '<b>'+gb(s.parts[se.name])+'</b></div>').join('')
-      ||'<div class=r>nothing resident</div>';
+    const rows=d.series.filter(se=>s.parts[se.name]).map(se=>{
+      const by=(se.by||[]).map(x=>x.name).join(', ');
+      return '<div class=r><i style="background:'+colour(se)+'"></i>'+esc(se.name)+
+        '<b>'+gb(s.parts[se.name])+'</b></div>'+
+        (by?'<div class=r style="padding-left:17px;font-size:11px">&larr; '+esc(by)+'</div>':'');
+    }).join('')||'<div class=r>nothing resident</div>';
     const end=new Date(new Date(s.t).getTime()+d.slot_minutes*60000);
     tip.innerHTML='<div class=h>'+hhmm(s.t)+'–'+
       String(end.getHours()).padStart(2,'0')+':'+String(end.getMinutes()).padStart(2,'0')+

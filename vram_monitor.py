@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
+import gpu_procs                                # per-process VRAM (PDH)
 import schedule                                 # look-ahead calendar (/schedule)
 
 # ---------------------------------------------------------------- config
@@ -327,6 +328,7 @@ def poll_loop():
 
         ollama_mb = sum(m["vram_mb"] for m in (models or []))
         other_mb  = max(0, used - ollama_mb) if used is not None else None
+        attrib    = attribute_vram(models, used)
         idle_s = None
         if _ctl["comfy_idle_since"] is not None:
             idle_s = int(time.monotonic() - _ctl["comfy_idle_since"])
@@ -338,6 +340,7 @@ def poll_loop():
                 "models": models or [],
                 "used_mb": used, "total_mb": total, "util": util,
                 "ollama_mb": ollama_mb, "other_mb": other_mb,
+                "attrib": attrib,
                 "comfy": comfy,
                 "gate": gate,
                 "banner": banner,
@@ -492,10 +495,70 @@ def _resident_rows():
         return [dict(m) for m in _state.get("models", [])]
 
 
+def _classify_proc(p):
+    """(group, label) for a process holding VRAM, from jobs.json rules."""
+    hay = ((p.get("name") or "") + " " + (p.get("path") or "")).lower()
+    for rule in schedule.process_rules():
+        m = (rule.get("match") or "").lower()
+        if m and m in hay:
+            return rule.get("group", "app"), rule.get("label", p.get("name"))
+    return "app", p.get("name") or "?"
+
+
+def attribute_vram(models, used_mb):
+    """Break board VRAM into named holders instead of one "other" residual.
+
+    nvidia-smi cannot do this under WDDM, but the OS performance counters can -
+    see gpu_procs. The one case needing care is Ollama: llama-server's footprint
+    is the model weights /api/ps reports PLUS the engine's own overhead (vision
+    projector, MTP draft cache, CUDA context), and lumping that overhead into
+    "other" is what made it look like ComfyUI was holding several GB while it
+    was idle. Split the two and say which is which.
+    """
+    ollama_mb = sum(m["vram_mb"] for m in (models or []))
+    s = gpu_procs.latest()
+    if not s.get("ok"):
+        # No counters: fall back to the old residual, honestly labelled.
+        rest = max(0, used_mb - ollama_mb) if used_mb is not None else None
+        return {"ok": False, "parts": ([{"label": "unattributed", "group": "unknown",
+                                         "mb": rest}] if rest else []),
+                "engine_mb": None, "procs": []}
+
+    groups, engine_mb = {}, 0
+    for p in s["procs"]:
+        group, label = _classify_proc(p)
+        mb = p["mb"]
+        if group == "ollama":
+            # Charge the model weights to the models themselves; whatever is left
+            # in the process beyond them is engine overhead.
+            mb = max(0, mb - ollama_mb)
+            ollama_mb = max(0, ollama_mb - (p["mb"] - mb))
+            engine_mb += mb
+            label = "Ollama engine"
+            if not mb:
+                continue
+        g = groups.setdefault(label, {"label": label, "group": group, "mb": 0,
+                                      "procs": []})
+        g["mb"] += mb
+        g["procs"].append({"pid": p["pid"], "name": p["name"], "mb": p["mb"]})
+
+    parts = sorted(groups.values(), key=lambda g: -g["mb"])
+    # Whatever the board reports beyond every process: driver context, and any
+    # process whose counter we could not read. Never silently folded into a name.
+    if used_mb is not None:
+        rest = used_mb - s["total_mb"]
+        if rest >= 64:
+            parts.append({"label": "driver reserve", "group": "unknown",
+                          "mb": rest, "procs": []})
+    return {"ok": True, "parts": parts, "engine_mb": engine_mb,
+            "procs": s["procs"][:12]}
+
+
 def _board_snapshot():
     with _lock:
         return {"used_mb": _state.get("used_mb"), "total_mb": _state.get("total_mb"),
-                "other_mb": _state.get("other_mb")}
+                "other_mb": _state.get("other_mb"),
+                "attrib": _state.get("attrib")}
 
 
 def estimate_cost_mb(model):

@@ -120,6 +120,45 @@
     }
   ],
 
+  "_processes_comment": [
+    "How a process holding VRAM gets named on the dashboard and the chart.",
+    "First rule whose 'match' appears in the process name or full image path wins;",
+    "anything unmatched falls through to 'other apps'. Matching is lowercase substring.",
+    "",
+    "  group  ollama | comfyui | container | desktop | tools | app",
+    "  label  what the user sees",
+    "",
+    "The ollama group is special-cased: llama-server's VRAM is split into the model",
+    "weights Ollama reports via /api/ps and the remainder, which is the engine's own",
+    "overhead (vision projector, MTP draft cache, CUDA context, compute buffers)."
+  ],
+  "processes": [
+    { "match": "llama-server",   "group": "ollama",    "label": "Ollama engine" },
+    { "match": "\\ollama",       "group": "ollama",    "label": "Ollama server" },
+    { "match": "comfyui",        "group": "comfyui",   "label": "ComfyUI" },
+    { "match": "vmwp.exe",       "group": "container", "label": "WSL2 / Docker VM" },
+    { "match": "vmmem",          "group": "container", "label": "WSL2 / Docker VM" },
+    { "match": "docker desktop", "group": "container", "label": "Docker Desktop" },
+    { "match": "dwm.exe",        "group": "desktop",   "label": "Windows compositor" },
+    { "match": "csrss.exe",      "group": "desktop",   "label": "Windows compositor" },
+    { "match": "explorer.exe",   "group": "desktop",   "label": "Windows shell" },
+    { "match": "searchhost",     "group": "desktop",   "label": "Windows shell" },
+    { "match": "startmenu",      "group": "desktop",   "label": "Windows shell" },
+    { "match": "shellexperience","group": "desktop",   "label": "Windows shell" },
+    { "match": "applicationframe","group": "desktop",  "label": "Windows shell" },
+    { "match": "textinputhost",  "group": "desktop",   "label": "Windows shell" },
+    { "match": "phoneexperience","group": "desktop",   "label": "Windows shell" },
+    { "match": "system",         "group": "desktop",   "label": "Windows kernel" },
+    { "match": "claude.exe",     "group": "tools",     "label": "Claude Code" },
+    { "match": "chatgpt.exe",    "group": "tools",     "label": "Codex" },
+    { "match": "codex-",         "group": "tools",     "label": "Codex" },
+    { "match": "windowsterminal","group": "tools",     "label": "Terminal" },
+    { "match": "chrome.exe",     "group": "app",       "label": "Chrome" },
+    { "match": "msedgewebview2", "group": "app",       "label": "WebView2" },
+    { "match": "steamwebhelper", "group": "app",       "label": "Steam" },
+    { "match": "discord",        "group": "app",       "label": "Discord" }
+  ],
+
   "daemons": [
     {
       "id": "chat-responder",
